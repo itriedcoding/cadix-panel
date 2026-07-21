@@ -1,8 +1,6 @@
 *.log
-!install-proxmox.sh
 *.tmp
 .env
-.env.local
 .vscode/
 .idea/
 *.swp
