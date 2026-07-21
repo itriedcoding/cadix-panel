@@ -1,0 +1,12 @@
+*.log
+!install-proxmox.sh
+*.tmp
+.env
+.env.local
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
