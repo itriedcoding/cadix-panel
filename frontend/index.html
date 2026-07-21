@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cadix Panel</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+<style>
+:root{--bg:#0f1923;--surface:#1a2332;--border:#2a3a4a;--text:#e0e0e0;--muted:#8899aa;--primary:#4a9eff}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+.sidebar{width:240px;background:var(--surface);position:fixed;top:0;left:0;bottom:0;z-index:100}
+.main{margin-left:240px;padding:24px;min-height:100vh}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;transition:.15s}
+.card:hover{border-color:var(--primary)}
+.val{font-size:28px;font-weight:700;color:#fff}
+.lbl{font-size:13px;color:var(--muted);margin-top:4px}
+.icon-box{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0}
+.badge-online,.badge-offline{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600}
+.badge-online{background:rgba(74,222,128,.15);color:#4ade80}
+.badge-offline{background:rgba(248,113,113,.15);color:#f87171}
+.nav-item{padding:12px 20px;color:var(--muted);cursor:pointer;transition:.15s;display:flex;align-items:center;gap:12px;text-transform:capitalize;border-left:3px solid transparent}
+.nav-item:hover,.nav-item.active{background:var(--bg);color:#fff;border-left-color:var(--primary)}
+.nav-item i{width:20px}
+.sidebar-status{position:absolute;bottom:20px;left:20px;right:20px;background:var(--bg);border-radius:8px;padding:12px 16px;display:flex;align-items:center;font-size:12px;color:var(--muted)}
+table{width:100%;border-collapse:collapse}
+th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border);padding:12px 8px;text-align:left}
+td{padding:12px 8px;border-bottom:1px solid var(--border)}
+.section-title{font-size:18px;font-weight:600;margin-bottom:16px;color:#fff}
+.progress{background:var(--bg);height:8px;border-radius:4px;overflow:hidden}
+.progress-bar{background:linear-gradient(90deg,var(--primary),#7c5cfc);border-radius:4px;height:100%;transition:width .3s}
+.form-control,.form-select{background:var(--bg);border:1px solid var(--border);color:#fff;border-radius:8px}
+.form-control:focus{background:var(--bg);border-color:var(--primary);color:#fff;box-shadow:none}
+.form-label{color:var(--muted);font-size:13px;margin-bottom:4px}
+.modal-content{background:var(--surface);border:1px solid var(--border)}
+.modal-header,.modal-footer{border-color:var(--border)}
+.btn{font-size:13px;border-radius:8px;padding:8px 16px;font-weight:500}
+.btn-outline-secondary{color:var(--muted);border-color:var(--border)}
+.btn-outline-secondary:hover{background:var(--border);color:#fff}
+.muted{color:var(--muted)}
+.empty{text-align:center;padding:60px 20px;color:var(--muted)}
+.alert-warning{background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.2);color:#fbbf24;font-size:13px;border-radius:8px;padding:12px}
+.alert-success{background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.2);color:#4ade80;font-size:13px;border-radius:8px;padding:12px}
+h2{color:#fff}
+pre{margin:0}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
+</html>
