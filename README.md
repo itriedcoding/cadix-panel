@@ -1,132 +1,117 @@
-# TooO Cadix Panel
+# Cadix Panel
 
-A lightweight, high-performance VPS control panel alternative to Proxmox VE, built with Go (backend) and TypeScript (frontend).
+Complete VPS control panel built with **Go** (backend), **TypeScript** (frontend), **SQLite** (database), and **Bash** (system tools). Lightweight alternative to Proxmox VE.
 
 ## Tech Stack
 
-| Component | Technology |
-|-----------|------------|
-| Backend | **Go (Golang)** - High-performance daemon |
-| Frontend | **TypeScript + React** - Modern dashboard |
-| Database | **SQL (SQLite)** - Lightweight & reliable |
-| Scripting | **Bash** - System integration |
+| Layer | Technology |
+|-------|-----------|
+| **Backend** | **Go (Golang)** - High-performance HTTP daemon with SQLite integration |
+| **Frontend** | **TypeScript + React** - Modern dashboard with live updates |
+| **Database** | **SQL (SQLite)** - Zero-configuration, lightweight |
+| **System** | **Bash** - Monitoring, backup, cleanup scripts |
 
 ## Features
 
-- **High Performance**: Go backend for fast API responses
-- **Modern UI**: TypeScript/React dashboard with Bootstrap
-- **SSL Ready**: Integrated Let's Encrypt support
-- **Zero-Downtime**: Graceful systemd service management
-- **Lightweight**: Minimal RAM/CPU footprint
-- **Scalable**: Supports any server size from 512MB RAM
+- **Complete Server Management** - Add, remove, start, stop, restart servers
+- **Real-time System Monitoring** - CPU, RAM, storage, processes, network
+- **Live Dashboard** - All metrics update every 30 seconds
+- **Process Viewer** - Top 20 processes by CPU usage
+- **Update Management** - Check and install system updates
+- **Firewall Control** - UFW integration from the panel
+- **SSL/TLS Ready** - Let's Encrypt certificate support via Certbot
+- **Custom Domain** - Nginx reverse proxy with your own domain
+- **Auto-renew SSL** - Certbot handles certificate renewal
+- **Dark Theme** - Modern dark UI optimized for server management
+- **System Tools** - Monitor, backup, and cleanup scripts included
 
 ## Requirements
 
-- Ubuntu 22.04 LTS, 24.04 LTS, Debian 11+, Debian 12+
+- Ubuntu 22.04 / 24.04 LTS or Debian 11+
 - Root access
 - 512MB+ RAM
-- 1GB+ disk space
 - Domain name (optional, for SSL)
 
 ## Quick Install
 
-### Basic Installation
+### One-command install:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/itriedcoding/tooocadix-panel/main/install.sh | bash -s
+curl -sSL https://raw.githubusercontent.com/itriedcoding/cadix-panel/main/install.sh | bash -s
 ```
 
-### With SSL/Domain
+### With custom domain and SSL:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/itriedcoding/tooocadix-panel/main/install.sh | bash -s -- -d panel.example.com -e admin@example.com
+curl -sSL https://raw.githubusercontent.com/itriedcoding/cadix-panel/main/install.sh | bash -s -- -d panel.yourdomain.com -e admin@yourdomain.com
 ```
 
-## Command Line Options
+## After Installation
 
-```bash
-./install.sh [OPTIONS]
+Access the panel at `http://YOUR_SERVER_IP`
 
-Options:
-  -d, --domain DOMAIN    Domain for SSL certificate
-  -e, --email EMAIL      Email for Let's Encrypt registration
-  -h, --help             Show help message
+### API Endpoints
 
-Examples:
-  ./install.sh
-  ./install.sh -d vps.example.com -e admin@example.com
-```
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Dashboard UI |
+| `/api/status` | GET | Panel status & version |
+| `/api/servers` | GET | List all servers |
+| `/api/servers/add` | POST | Add a new server |
+| `/api/servers/remove` | POST | Remove a server |
+| `/api/servers/start` | POST | Start a server |
+| `/api/servers/stop` | POST | Stop a server |
+| `/api/servers/restart` | POST | Restart a server |
+| `/api/system` | GET | Full system information |
+| `/api/system/cpu` | GET | CPU usage details |
+| `/api/system/memory` | GET | Memory details |
+| `/api/system/disk` | GET | Disk usage details |
+| `/api/system/processes` | GET | Top 20 processes |
+| `/api/system/network` | GET | Open ports & connections |
+| `/api/update` | POST | Trigger system update |
+| `/api/update/check` | GET | Check for updates |
+| `/api/firewall` | GET/POST | Firewall status & management |
 
 ## Architecture
 
 ```
-                    ┌─────────────────────┐
-                    │   Internet/Users    │
-                    └──────────┬──────────┘
+                    ┌──────────────────────┐
+                    │   Internet / Users   │
+                    └──────────┬───────────┘
                                │
-                     ┌─────────▼──────────┐
-                     │    Nginx (Port 80) │
-                     │   Reverse Proxy    │
-                     └─────────┬──────────┘
+                    ┌──────────▼───────────┐
+                    │   Nginx (80/443)     │
+                    │   Reverse Proxy      │
+                    └──────────┬───────────┘
                                │
-                     ┌──────────▼──────────┐
-                     │  TooO Cadix Panel   │
-                     │   (Go HTTP Server)  │
-                     └──────────┬──────────┘
-                               │
-         ┌───────────────────────┼───────────────────────┐
-         │   ┌───────────────┐ │ ┌─────────────────┐ │
-         │   │   SQLite DB   │ │ │ System Tools    │ │
-         │   │ (SQL Tables)  │ │ │ (Bash Scripts)  │ │
-         │   └───────────────┘ │ └─────────────────┘ │
-         └───────────────────────────────────────────┘
+                    ┌──────────▼───────────┐
+                    │   Go Backend (:5000) │
+                    │   HTTP API Server    │
+                    └────┬─────────────┬───┘
+                         │             │
+                    ┌────▼────┐   ┌────▼────┐
+                    │ SQLite  │   │  Bash   │
+                    │  DB     │   │  Tools  │
+                    └─────────┘   └─────────┘
 ```
 
-## What Gets Installed
-
-1. **Go Backend**: High-performance HTTP server with SQLite database
-2. **TypeScript Frontend**: Modern React-based dashboard
-3. **Nginx**: Reverse proxy on ports 80/443
-4. **Certbot**: Automatic SSL certificate management
-5. **UFW Firewall**: Configured security with essential ports
-6. **Systemd Service**: Auto-start on boot
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Web dashboard |
-| `/api/status` | GET | Server status/response |
-| `/api/servers` | GET | List all managed servers |
-| `/api/system` | GET | System metrics (CPU, RAM, storage) |
-| `/api/update` | POST | Trigger system update check |
-
-## Installation Flow
+## Commands
 
 ```bash
-# 1. Download installer
-curl -sSL https://raw.githubusercontent.com/itriedcoding/tooocadix-panel/main/install.sh -o install.sh
+# Check service status
+systemctl status cadix-panel
 
-# 2. Make executable
-chmod +x install.sh
+# View logs
+journalctl -u cadix-panel -f
 
-# 3. Run as root
-sudo ./install.sh
+# Run monitor
+/opt/cadix-panel/tools/monitor.sh
 
-# 4. (Optional) With SSL
-sudo ./install.sh -d yourdomain.com -e admin@yourdomain.com
-```
+# Run backup
+/opt/cadix-panel/tools/backup.sh
 
-## Post-Installation
-
-Access the panel:
-- **Web Interface**: `http://YOUR_SERVER_IP`
-- **API Status**: `http://YOUR_SERVER_IP/api/status`
-
-Check service status:
-```bash
-systemctl status tooocadix-panel
-journalctl -u tooocadix-panel -f
+# Run cleanup
+/opt/cadix-panel/tools/cleanup.sh
 ```
 
 ## Database Schema
@@ -137,95 +122,32 @@ CREATE TABLE servers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     ip TEXT NOT NULL,
+    port INTEGER DEFAULT 22,
+    username TEXT DEFAULT 'root',
     status TEXT DEFAULT 'offline',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Settings table
-CREATE TABLE settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
 
 -- Users table
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'admin',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-## Configuration
-
-| Path | Description |
-|------|-------------|
-| `/opt/tooocadix-panel/app/` | Go backend source |
-| `/opt/tooocadix-panel/data/` | SQLite database |
-| `/opt/tooocadix-panel/frontend/` | TypeScript frontend |
-| `/opt/tooocadix-panel/logs/` | Application logs |
-| `/etc/systemd/system/tooocadix-panel.service` | Systemd unit file |
-
-## Security
-
-- UFW firewall enabled with essential ports only
-- SSH (port 22) always allowed
-- Let's Encrypt certificates auto-renew
-- All traffic goes through Nginx reverse proxy
-
-## Troubleshooting
-
-### Panel not accessible?
-
-```bash
-# Check service
-systemctl status tooocadix-panel
-
-# Check logs
-journalctl -u tooocadix-panel -f
-
-# Check port
-ss -tlnp | grep 5000
-
-# Restart
-systemctl restart tooocadix-panel
-```
-
-### SSL Issues?
-
-```bash
-# Check cert status
-certbot certificates
-
-# Force renewal
-certbot renew
-
-# Nginx test
-nginx -t && systemctl reload nginx
-```
-
-## Development
-
-```bash
-# Clone
-git clone https://github.com/itriedcoding/tooocadix-panel.git
-cd tooocadix-panel
-
-# Backend: Go
-cd app && go build -o panel .
-
-# Frontend: TypeScript
-cd frontend && npm install && npm run build
+-- Metrics table
+CREATE TABLE metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER, cpu REAL, ram REAL, disk REAL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
 ## License
 
-MIT License - Feel free to use and modify.
-
-## Contributing
-
-Pull requests welcome! Areas for contribution:
-- Bug fixes
-- New features
-- Documentation
-- Tests
+MIT
