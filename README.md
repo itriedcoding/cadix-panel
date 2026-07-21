@@ -1,103 +1,55 @@
-# Proxmox VE All-in-One Installer
+# VPS Control Panel
 
-A single-command installer for Proxmox VE that supports Ubuntu 22.04, Ubuntu 24.04, and Debian 11+ with integrated SSL/certbot domain support.
+A lightweight, self-hosted VPS control panel - an alternative to Proxmox VE that runs on Ubuntu and Debian. Manage your servers through a modern web interface with full SSL support.
 
 ## Features
 
-- **One-Command Installation**: Install Proxmox VE with a single command
-- **Multiple OS Support**: Ubuntu 22.04, Ubuntu 24.04, Debian 11, Debian 12+
-- **Integrated SSL**: Automatic Let's Encrypt certificate setup via Certbot
-- **Domain Integration**: Custom domain support with nginx proxy
-- **Ready-to-use**: Fully configured Proxmox environment
+- Lightweight web-based control panel
+- **One-Command Installation**: Single script installs everything
+- **SSL Ready**: Integrated Let's Encrypt certificate setup
+- **Domain Support**: Custom domain with automatic HTTPS
+- **Resource Monitoring**: Real-time CPU, RAM, storage stats
+- **Active Development**: Auto-update mechanism
+- **Lightweight**: Minimal RAM/CPU overhead vs Proxmox
 
 ## Requirements
 
-- Ubuntu 22.04 LTS or 24.04 LTS
-- Debian 11 or 12
+- Ubuntu 22.04 LTS, 24.04 LTS, Debian 11+, or Debian 12+
 - Root access
+- 512MB+ RAM
+- 1GB+ disk space
 - Domain name (optional, for SSL)
 
 ## Quick Install
 
-### Basic Install (no domain)
+### Basic Installation
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/itriedcoding/proxmox-installer/main/install-proxmox.sh | bash -s
+curl -sSL https://raw.githubusercontent.com/itriedcoding/vps-panel/main/install.sh | bash -s
 ```
 
-Or download and run:
+### With Custom Domain and SSL
 
 ```bash
-wget https://raw.githubusercontent.com/itriedcoding/proxmox-installer/main/install-proxmox.sh
-chmod +x install-proxmox.sh
-sudo ./install-proxmox.sh
-```
-
-### With Domain and SSL
-
-```bash
-sudo ./install-proxmox.sh -d pve.yourdomain.com -e admin@yourdomain.com
+curl -sSL https://raw.githubusercontent.com/itriedcoding/vps-panel/main/install.sh | bash -s -- -d vps.yourdomain.com -e admin@yourdomain.com
 ```
 
 ## All Options
 
 ```bash
-sudo ./install-proxmox.sh -d DOMAIN -e EMAIL [-u USERNAME] [-p PASSWORD]
+./install.sh [OPTIONS]
 
 Options:
-  -d, --domain DOMAIN    Domain name for SSL/certbot
-  -e, --email EMAIL      Email for certbot registration
-  -u, --user USERNAME    Admin username (default: admin)
-  -p, --pass PASSWORD    Admin password
+  -d, --domain DOMAIN    Domain for SSL certificate
+  -e, --email EMAIL      Email for Let's Encrypt registration
   -h, --help             Show help message
 ```
 
-## Examples
+## Access
 
-### Basic Installation
-```bash
-sudo ./install-proxmox.sh
-```
-
-### With Custom Admin User
-```bash
-sudo ./install-proxmox.sh -u proxmoadmin -p SecurePassword123
-```
-
-### Production Setup with SSL
-```bash
-sudo ./install-proxmox.sh -d pve.example.com -e admin@example.com
-```
-
-### Full Custom Setup
-```bash
-sudo ./install-proxmox.sh -d proxmox.example.com -e dev@example.com -u pveadmin -p MySecurePass123
-```
-
-## What Gets Installed
-
-1. **Proxmox VE Packages**: Core virtualization platform
-2. **Nginx**: Web server and reverse proxy
-3. **Certbot**: Automatic SSL certificate management
-4. **FUSE Support**: For storage connectivity
-5. **Configured Services**: All services enabled and ready
-
-## Post-Installation
-
-### Access Web Interface
-- **URL**: `https://YOUR_SERVER_IP:8006` or `https://yourdomain.com` (if configured)
-- **Username**: `root`
-- **Password**: Set by you during installation
-
-### Change Admin Password
-```bash
-passwd admin
-```
-
-### Update Proxmox
-```bash
-apt update && apt upgrade -y
-```
+After installation, access the control panel at:
+- **Web Interface**: `http://YOUR_SERVER_IP`
+- **API Status**: `http://YOUR_SERVER_IP/api/status`
 
 ## Architecture
 
@@ -106,88 +58,110 @@ apt update && apt upgrade -y
                     │   Internet/Users    │
                     └──────────┬──────────┘
                                │
+                     ┌─────────▼──────────┐
+                     │    Nginx (Port 80) │
+                     │   Reverse Proxy    │
+                     └─────────┬──────────┘
+                               │
                     ┌──────────▼──────────┐
-                    │      Nginx          │
-                    │   (Reverse Proxy)   │
-                    └─────┬─────────┬─────┘
-                          │         │
-           ┌──────────────┘         └──────────────┐
-           │                                       │
-┌──────────▼──────────┐               ┌────────────▼──────────┐
-│   Let's Encrypt     │               │   Proxmox Web GUI     │
-│      Certbot        │               │        (Port 8006)    │
-└─────────────────────┘               └───────────────────────┘
-           │                                       │
-           │              ┌────────────────────────┘
-           │              │
-           │     ┌────────▼────────┐
-           │     │  Proxmox VE     │
-           │     │   Services      │
-           │     │ pvedaemon,pveproxy,
-           │     │ pvestatd, etc.  │
-           │     └─────────────────┘
-           │
-    ┌──────▼──────┐
-    │  Filesystem │
-    │   (FUSE)    │
-    └─────────────┘
+                    │   VPS Control Panel │
+                    │    (Flask/Gunicorn) │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │   Python Backend    │
+                    │  System Monitoring  │
+                    └─────────────────────┘
 ```
+
+## What Gets Installed
+
+1. **Flask Web Application**: Modern control panel with Bootstrap UI
+2. **Gunicorn**: WSGI HTTP server
+3. **Nginx**: Reverse proxy (port 80/443)
+4. **Certbot**: Let's Encrypt SSL certificates
+5. **UFW Firewall**: Configured with essential ports open
+6. **Systemd Service**: Auto-start on boot
+
+## Auto-Update
+
+The panel includes an automatic update check. To manually update:
+
+```bash
+cd /opt/vps-panel
+git pull origin main
+systemctl restart vps-panel
+```
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web interface |
+| `/api/status` | GET | Panel status |
+| `/api/servers` | GET | List servers |
+| `/api/servers` | POST | Add server |
+| `/api/system` | GET | System metrics |
+
+## Configuration
+
+- Panel files: `/opt/vps-panel/`
+- Data: `/opt/vps-panel/data/`
+- Logs: `/opt/vps-panel/logs/`
+- Service: `vps-panel`
+
+## System Requirements Comparison
+
+| Feature | Proxmox VE | VPS Panel |
+|---------|-----------|-----------|
+| RAM Minimum | 4GB | 512MB |
+| CPU | 2+ cores | 1 core |
+| Disk | 64GB+ | 1GB+ |
+| Web Port | 8006 | 80 |
+| Updates | Apt | Git |
 
 ## Security Notes
 
-- Default no-subscription repository is used
-- SSL certificates are automatically renewed by certbot
-- Firewall configuration should be adjusted for your needs
-- Change default passwords immediately after installation
+- Firewall enabled with UFW
+- SSH access preserved
+- Let's Encrypt certificates auto-renew
+- Default credentials should be changed immediately
 
 ## Troubleshooting
 
-### Can't access web interface?
-```bash
-# Check if services are running
-systemctl status pvedaemon pveproxy
+### Panel not loading?
 
-# Check firewall
-ufw status
+```bash
+# Check service
+systemctl status vps-panel
+
+# Check logs
+journalctl -u vps-panel -f
+
+# Restart
+systemctl restart vps-panel
 ```
 
-### SSL certificate issues?
+### SSL Issues?
+
 ```bash
-# Renew certificates manually
+# Renew certificates
 certbot renew
 
-# Check certificate status
+# Check certificates
 certbot certificates
-```
 
-### Domain not resolving?
-```bash
-# Ensure DNS points to your server IP
-dig yourdomain.com
+# Force reconfigure nginx
+nginx -t && systemctl reload nginx
 ```
 
 ## Development
 
-### Build Locally
 ```bash
-git clone https://github.com/itriedcoding/proxmox-installer.git
-cd proxmox-installer
-chmod +x install-proxmox.sh
+git clone https://github.com/itriedcoding/vps-panel.git
+cd vps-panel
+chmod +x install.sh
 ```
-
-## Changelog
-
-### v2.0.0
-- Added full Ubuntu 22.04/24.04 support
-- Added Debian 11+ support
-- Integrated Let's Encrypt SSL with certbot
-- Domain support for seamless HTTPS
-- Nginx reverse proxy configuration
-- Automated admin user creation
-- UFW firewall integration
-
-### v1.0.0
-- Initial release with basic Proxmox installation
 
 ## License
 
@@ -195,4 +169,12 @@ MIT License - Feel free to use and modify.
 
 ## Contributing
 
-Pull requests welcome!
+Pull requests are welcome! Feel free to:
+- Report bugs
+- Add features
+- Improve documentation
+- Fix typos
+
+## Sponsors
+
+Support this project by starring the GitHub repo!
