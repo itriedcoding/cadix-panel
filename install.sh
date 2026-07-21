@@ -9,75 +9,58 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-show_banner() {
-    cat << EOF
-
-${GREEN}========================================${NC}
-${GREEN}  Cadix Panel Installer v$VERSION${NC}
-${GREEN}========================================${NC}
-${YELLOW}Go Backend + TypeScript Frontend${NC}
-
-EOF
-}
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then log_error "Must be root"; exit 1; fi
-}
+check_root() { [[ $EUID -ne 0 ]] && log_error "Must be root" && exit 1; }
 
 detect_os() {
-    source /etc/os-release 2>/dev/null || true; log_info "OS: $NAME $VERSION_ID"
+    source /etc/os-release 2>/dev/null || true
+    log_info "OS: $NAME $VERSION_ID"
     case "$NAME" in Ubuntu|Debian) ;; *) log_error "Unsupported OS"; exit 1 ;; esac
 }
 
 wait_apt() {
     local i=0
-    while [[ $i -lt 30 ]]; do
+    while [[ $i -lt 60 ]]; do
         if ! lsof /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 && \
            ! lsof /var/lib/dpkg/lock &>/dev/null 2>&1 && \
-           ! lsof /var/lib/apt/lists/lock &>/dev/null 2>&1; then return 0; fi
+           ! lsof /var/lib/apt/lists/lock &>/dev/null 2>&1; then
+            return 0
+        fi
         sleep 2; i=$((i+1))
     done
-}
-
-prep_system() {
-    log_info "Preparing system..."
-    if [[ -f /etc/apt/sources.list ]]; then
-        grep -qE "^deb " /etc/apt/sources.list 2>/dev/null && mv /etc/apt/sources.list /etc/apt/sources.list.backup 2>/dev/null || true
-    fi
-    wait_apt; apt-get update -qq 2>/dev/null || true
+    log_warn "apt lock timeout"
 }
 
 install_deps() {
-    log_info "Installing dependencies..."
+    log_info "Installing system packages..."
     wait_apt
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl wget git jq sqlite3 \
-        nginx certbot python3-certbot-nginx ufw 2>/dev/null || true
-    
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        curl wget git jq sqlite3 nginx certbot python3-certbot-nginx ufw lsof 2>/dev/null || true
+
     if ! go version &>/dev/null; then
         log_info "Installing Go..."
         wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz -O /tmp/go.tar.gz
-        tar -C /usr/local -xzf /tmp/go.tar.gz 2>/dev/null
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf /tmp/go.tar.gz
         export PATH=/usr/local/go/bin:$PATH
         echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
     fi
-    
+
     if ! node --version &>/dev/null; then
         log_info "Installing Node.js..."
         curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>/dev/null || true
         apt-get install -y nodejs 2>/dev/null || true
     fi
-    
-    log_info "Dependencies installed"
+    log_info "Dependencies ready"
 }
 
 setup_dirs() {
-    log_info "Setting up directories..."
-    mkdir -p "$INSTALL_DIR"/{backend,frontend/src,data,logs,tools}
+    log_info "Creating directories..."
+    mkdir -p "$INSTALL_DIR"/{backend,frontend,frontend/src,data,logs,tools}
     chmod -R 755 "$INSTALL_DIR"
 }
 
 write_go_backend() {
-    log_info "Writing Go backend..."
+    log_info "Writing Go backend ($(wc -l <<< 'GOEOF') lines)..."
 
     cat > "$INSTALL_DIR/backend/main.go" << 'GOEOF'
 package main
@@ -91,6 +74,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,8 +83,11 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var db *sql.DB
-var mu sync.Mutex
+var (
+	db        *sql.DB
+	mu        sync.RWMutex
+	startTime time.Time
+)
 
 type Server struct {
 	ID       int    `json:"id"`
@@ -117,118 +104,147 @@ type Server struct {
 }
 
 type SysInfo struct {
-	Hostname    string `json:"hostname"`
-	Uptime      string `json:"uptime"`
-	CPU         string `json:"cpu"`
-	CPUCores    int    `json:"cpu_cores"`
-	RAMTotal    string `json:"ram_total"`
-	RAMUsed     string `json:"ram_used"`
-	RAMFree     string `json:"ram_free"`
-	RAMPercent  string `json:"ram_percent"`
+	Hostname     string `json:"hostname"`
+	Uptime       string `json:"uptime"`
+	CPU          string `json:"cpu"`
+	CPUCores     int    `json:"cpu_cores"`
+	RAMTotal     string `json:"ram_total"`
+	RAMUsed      string `json:"ram_used"`
+	RAMFree      string `json:"ram_free"`
+	RAMPercent   string `json:"ram_percent"`
 	StorageTotal string `json:"storage_total"`
 	StorageUsed  string `json:"storage_used"`
 	StorageFree  string `json:"storage_free"`
-	LoadAvg     string `json:"load_avg"`
-	Processes   int    `json:"processes"`
-	OS          string `json:"os"`
-	Kernel      string `json:"kernel"`
+	LoadAvg      string `json:"load_avg"`
+	Processes    int    `json:"processes"`
+	OS           string `json:"os"`
+	Kernel       string `json:"kernel"`
 }
 
-type ProcessInfo struct {
-	PID    int    `json:"pid"`
-	Name   string `json:"name"`
-	CPU    string `json:"cpu"`
-	RAM    string `json:"ram"`
-	State  string `json:"state"`
+type RouteInfo struct {
+	Path   string `json:"path"`
+	Method string `json:"method"`
+	Desc   string `json:"desc"`
 }
 
-type APIConfig struct {
+type PanelStatus struct {
 	Version     string `json:"version"`
 	Uptime      string `json:"uptime"`
 	ServerCount int    `json:"server_count"`
+	GoVersion   string `json:"go_version"`
 }
-
-var startTime time.Time
 
 func main() {
 	startTime = time.Now()
+	initLogging()
+	log.Println("Cadix Panel v2.0.0 starting...")
+
 	var err error
-	db, err = sql.Open("sqlite3", "/opt/cadix-panel/data/panel.db")
+	dbPath := "/opt/cadix-panel/data/panel.db"
+	os.MkdirAll(filepath.Dir(dbPath), 0755)
+	db, err = sql.Open("sqlite3", dbPath)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Database open failed: %v", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 
 	initDB()
 
 	mux := http.NewServeMux()
-	mux.Handle("/", handleCORS(handleAPI))
-	mux.Handle("/api/", handleCORS(handleAPI))
-	mux.Handle("/api/status", handleCORS(apiStatus))
-	mux.Handle("/api/servers", handleCORS(apiServers))
-	mux.Handle("/api/servers/add", handleCORS(apiServerAdd))
-	mux.Handle("/api/servers/remove", handleCORS(apiServerRemove))
-	mux.Handle("/api/servers/start", handleCORS(apiServerStart))
-	mux.Handle("/api/servers/stop", handleCORS(apiServerStop))
-	mux.Handle("/api/servers/restart", handleCORS(apiServerRestart))
-	mux.Handle("/api/system", handleCORS(apiSystem))
-	mux.Handle("/api/system/cpu", handleCORS(apiSystemCPU))
-	mux.Handle("/api/system/memory", handleCORS(apiSystemMemory))
-	mux.Handle("/api/system/disk", handleCORS(apiSystemDisk))
-	mux.Handle("/api/system/processes", handleCORS(apiSystemProcesses))
-	mux.Handle("/api/system/network", handleCORS(apiSystemNetwork))
-	mux.Handle("/api/update", handleCORS(apiUpdate))
-	mux.Handle("/api/update/check", handleCORS(apiUpdateCheck))
-	mux.Handle("/api/firewall", handleCORS(apiFirewall))
-	
-	mux.Handle("/health", handleCORS(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]string{"status": "healthy"})
-	}))
 
-	log.Println("Cadix Panel starting on :5000")
-	log.Fatal(http.ListenAndServe(":5000", mux))
+	mux.HandleFunc("/", handleCORS(rootHandler))
+	mux.HandleFunc("/api/status", handleCORS(apiStatus))
+	mux.HandleFunc("/api/servers", handleCORS(apiServers))
+	mux.HandleFunc("/api/servers/add", handleCORS(apiServerAdd))
+	mux.HandleFunc("/api/servers/remove", handleCORS(apiServerRemove))
+	mux.HandleFunc("/api/servers/start", handleCORS(apiServerStart))
+	mux.HandleFunc("/api/servers/stop", handleCORS(apiServerStop))
+	mux.HandleFunc("/api/servers/restart", handleCORS(apiServerRestart))
+	mux.HandleFunc("/api/system", handleCORS(apiSystem))
+	mux.HandleFunc("/api/system/cpu", handleCORS(apiSystemCPU))
+	mux.HandleFunc("/api/system/memory", handleCORS(apiSystemMemory))
+	mux.HandleFunc("/api/system/disk", handleCORS(apiSystemDisk))
+	mux.HandleFunc("/api/system/processes", handleCORS(apiSystemProcesses))
+	mux.HandleFunc("/api/system/network", handleCORS(apiSystemNetwork))
+	mux.HandleFunc("/api/update", handleCORS(apiUpdate))
+	mux.HandleFunc("/api/update/check", handleCORS(apiUpdateCheck))
+	mux.HandleFunc("/api/firewall", handleCORS(apiFirewall))
+	mux.HandleFunc("/api/routes", handleCORS(apiRoutes))
+
+	log.Println("Server listening on :5000")
+	if err := http.ListenAndServe(":5000", mux); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
 }
 
-func handleCORS(h http.HandlerFunc) http.HandlerFunc {
+func initLogging() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	f, err := os.OpenFile("/opt/cadix-panel/logs/panel.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		log.SetOutput(f)
+	}
+}
+
+func handleCORS(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("X-Powered-By", "Cadix Panel")
 		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK); return
+			w.WriteHeader(http.StatusOK)
+			return
 		}
-		h(w, r)
+		fn(w, r)
 	}
 }
 
-func handleAPI(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	if path == "/" || path == "" {
-		data, _ := os.ReadFile("/opt/cadix-panel/frontend/index.html")
-		w.Header().Set("Content-Type", "text/html")
-		w.Write(data)
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		writeError(w, 404, "not found")
 		return
 	}
-	writeJSON(w, map[string]interface{}{"routes": getRoutes()})
+	data, err := os.ReadFile("/opt/cadix-panel/frontend/index.html")
+	if err != nil {
+		writeError(w, 500, "frontend not found")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(data)
 }
 
-func getRoutes() []map[string]string {
-	return []map[string]string{
-		{"path": "/", "method": "GET", "desc": "Dashboard"},
-		{"path": "/api/status", "method": "GET", "desc": "Panel status"},
-		{"path": "/api/servers", "method": "GET", "desc": "List servers"},
-		{"path": "/api/servers/add", "method": "POST", "desc": "Add server"},
-		{"path": "/api/servers/remove", "method": "POST", "desc": "Remove server"},
-		{"path": "/api/system", "method": "GET", "desc": "System info"},
-		{"path": "/api/system/cpu", "method": "GET", "desc": "CPU info"},
-		{"path": "/api/system/memory", "method": "GET", "desc": "Memory info"},
-		{"path": "/api/system/disk", "method": "GET", "desc": "Disk info"},
-		{"path": "/api/system/processes", "method": "GET", "desc": "Process list"},
-		{"path": "/api/system/network", "method": "GET", "desc": "Network info"},
-		{"path": "/api/update", "method": "POST", "desc": "Trigger update"},
-		{"path": "/api/update/check", "method": "GET", "desc": "Check updates"},
+func apiRoutes(w http.ResponseWriter, r *http.Request) {
+	routes := []RouteInfo{
+		{"/", "GET", "Dashboard"},
+		{"/api/status", "GET", "Panel status"},
+		{"/api/servers", "GET", "List servers"},
+		{"/api/servers/add", "POST", "Add server"},
+		{"/api/servers/remove", "POST", "Remove server"},
+		{"/api/system", "GET", "System info"},
+		{"/api/system/cpu", "GET", "CPU details"},
+		{"/api/system/memory", "GET", "Memory details"},
+		{"/api/system/disk", "GET", "Disk details"},
+		{"/api/system/processes", "GET", "Running processes"},
+		{"/api/system/network", "GET", "Network connections"},
+		{"/api/update", "POST", "Run system update"},
+		{"/api/update/check", "GET", "Check for updates"},
+		{"/api/firewall", "GET,POST", "Firewall status/management"},
 	}
+	writeJSON(w, 200, routes)
 }
+
+// Database
 
 func initDB() {
 	schema := `
@@ -242,7 +258,8 @@ func initDB() {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE TABLE IF NOT EXISTS settings (
-		key TEXT PRIMARY KEY, value TEXT
+		key TEXT PRIMARY KEY,
+		value TEXT
 	);
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,12 +276,16 @@ func initDB() {
 		disk REAL,
 		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
-	
+
 	for _, q := range strings.Split(schema, ";") {
 		q = strings.TrimSpace(q)
-		if q != "" { db.Exec(q) }
+		if q != "" {
+			if _, err := db.Exec(q); err != nil {
+				log.Printf("Schema exec error: %v", err)
+			}
+		}
 	}
-	
+
 	var count int
 	db.QueryRow("SELECT COUNT(*) FROM servers").Scan(&count)
 	if count == 0 {
@@ -274,158 +295,150 @@ func initDB() {
 	}
 }
 
-// ---- API Handlers ----
+func queryServers() []Server {
+	rows, err := db.Query("SELECT id, name, ip, port, username, status, created_at FROM servers ORDER BY id")
+	if err != nil {
+		log.Printf("Query servers error: %v", err)
+		return []Server{}
+	}
+	defer rows.Close()
+
+	var servers []Server
+	for rows.Next() {
+		var s Server
+		if err := rows.Scan(&s.ID, &s.Name, &s.IP, &s.Port, &s.Username, &s.Status, &s.Created); err != nil {
+			log.Printf("Scan error: %v", err)
+			continue
+		}
+		s.Uptime = probeUptime(s.IP)
+		s.CPU = probeCPU(s.IP)
+		s.RAM = probeRAM(s.IP)
+		s.Storage = probeStorage(s.IP)
+		servers = append(servers, s)
+	}
+	return servers
+}
+
+// API Handlers
 
 func apiStatus(w http.ResponseWriter, r *http.Request) {
 	var count int
 	db.QueryRow("SELECT COUNT(*) FROM servers").Scan(&count)
-	writeJSON(w, APIConfig{
+	writeJSON(w, 200, PanelStatus{
 		Version:     "2.0.0",
 		Uptime:      fmt.Sprintf("%.0f", time.Since(startTime).Seconds()),
 		ServerCount: count,
+		GoVersion:   strings.TrimPrefix(runtimeVersion(), "go"),
 	})
 }
 
 func apiServers(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, name, ip, port, username, status, created_at FROM servers ORDER BY id")
-	if err != nil { writeJSON(w, []Server{}); return }
-	defer rows.Close()
-	
-	var servers []Server
-	for rows.Next() {
-		var s Server
-		rows.Scan(&s.ID, &s.Name, &s.IP, &s.Port, &s.Username, &s.Status, &s.Created)
-		s.Uptime = getServerUptime(s.IP)
-		s.CPU = getServerCPU(s.IP)
-		s.RAM = getServerRAM(s.IP)
-		s.Storage = getServerStorage(s.IP)
-		servers = append(servers, s)
+	servers := queryServers()
+	if servers == nil {
+		servers = []Server{}
 	}
-	writeJSON(w, servers)
+	writeJSON(w, 200, servers)
 }
 
 func apiServerAdd(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { writeJSON(w, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		writeError(w, 405, "post required")
+		return
+	}
 	var s Server
-	json.NewDecoder(r.Body).Decode(&s)
-	if s.Name == "" { writeJSON(w, map[string]string{"error": "name required"}); return }
-	if s.IP == "" { writeJSON(w, map[string]string{"error": "ip required"}); return }
-	if s.Port == 0 { s.Port = 22 }
-	if s.Username == "" { s.Username = "root" }
-	
-	_, err := db.Exec("INSERT INTO servers (name, ip, port, username) VALUES (?, ?, ?, ?)",
-		s.Name, s.IP, s.Port, s.Username)
-	if err != nil { writeJSON(w, map[string]string{"error": err.Error()}); return }
-	writeJSON(w, map[string]string{"status": "ok", "message": "Server added"})
+	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+		writeError(w, 400, "invalid json")
+		return
+	}
+	if s.Name == "" || s.IP == "" {
+		writeError(w, 400, "name and ip required")
+		return
+	}
+	if s.Port == 0 {
+		s.Port = 22
+	}
+	if s.Username == "" {
+		s.Username = "root"
+	}
+	_, err := db.Exec("INSERT INTO servers (name, ip, port, username) VALUES (?, ?, ?, ?)", s.Name, s.IP, s.Port, s.Username)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]string{"status": "ok", "message": "server added"})
 }
 
 func apiServerRemove(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { writeJSON(w, map[string]string{"error": "POST required"}); return }
-	var req struct { ID int `json:"id"` }
-	json.NewDecoder(r.Body).Decode(&req)
-	if req.ID == 0 { writeJSON(w, map[string]string{"error": "id required"}); return }
-	
+	if r.Method != "POST" {
+		writeError(w, 405, "post required")
+		return
+	}
+	var req struct{ ID int `json:"id"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeError(w, 400, "id required")
+		return
+	}
+	mu.Lock()
 	db.Exec("DELETE FROM servers WHERE id = ?", req.ID)
 	db.Exec("DELETE FROM metrics WHERE server_id = ?", req.ID)
-	writeJSON(w, map[string]string{"status": "ok", "message": "Server removed"})
+	mu.Unlock()
+	writeJSON(w, 200, map[string]string{"status": "ok", "message": "server removed"})
 }
 
 func apiServerStart(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { writeJSON(w, map[string]string{"error": "POST required"}); return }
-	var req struct { ID int `json:"id"` }
+	if r.Method != "POST" {
+		writeError(w, 405, "post required")
+		return
+	}
+	var req struct{ ID int `json:"id"` }
 	json.NewDecoder(r.Body).Decode(&req)
-	
-	go func() {
-		_, wg := exec.Command("systemctl", "start", "cadix-panel").CombinedOutput()
-		_ = wg
-	}()
-	
 	db.Exec("UPDATE servers SET status = 'online' WHERE id = ?", req.ID)
-	writeJSON(w, map[string]string{"status": "ok", "message": "Server started"})
+	writeJSON(w, 200, map[string]string{"status": "ok", "message": "server started"})
 }
 
 func apiServerStop(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { writeJSON(w, map[string]string{"error": "POST required"}); return }
-	var req struct { ID int `json:"id"` }
+	if r.Method != "POST" {
+		writeError(w, 405, "post required")
+		return
+	}
+	var req struct{ ID int `json:"id"` }
 	json.NewDecoder(r.Body).Decode(&req)
-	
 	db.Exec("UPDATE servers SET status = 'offline' WHERE id = ?", req.ID)
-	writeJSON(w, map[string]string{"status": "ok", "message": "Server stopped"})
+	writeJSON(w, 200, map[string]string{"status": "ok", "message": "server stopped"})
 }
 
 func apiServerRestart(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { writeJSON(w, map[string]string{"error": "POST required"}); return }
-	
+	if r.Method != "POST" {
+		writeError(w, 405, "post required")
+		return
+	}
 	exec.Command("systemctl", "restart", "cadix-panel").CombinedOutput()
-	writeJSON(w, map[string]string{"status": "ok", "message": "Server restarted"})
+	writeJSON(w, 200, map[string]string{"status": "ok", "message": "server restarting"})
 }
 
 func apiSystem(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
 	info := SysInfo{}
 	info.Hostname, _ = os.Hostname()
-	
-	if d, err := ioutil.ReadFile("/proc/uptime"); err == nil {
-		var u float64; fmt.Sscanf(string(d), "%f", &u)
-		days := int(u / 86400); hrs := int(u/3600) % 24; mins := int(u/60) % 60
-		info.Uptime = fmt.Sprintf("%dd %dh %dm", days, hrs, mins)
-	}
-	
-	if d, err := ioutil.ReadFile("/proc/cpuinfo"); err == nil {
-		for _, l := range strings.Split(string(d), "\n") {
-			if strings.Contains(l, "model name") {
-				info.CPU = strings.TrimSpace(strings.Split(l, ":")[1])
-			}
-			if strings.HasPrefix(l, "processor") { info.CPUCores++ }
-		}
-	}
-	
-	if d, err := ioutil.ReadFile("/proc/meminfo"); err == nil {
-		for _, l := range strings.Split(string(d), "\n") {
-			f := strings.Fields(l)
-			if len(f) < 2 { continue }
-			if strings.HasPrefix(l, "MemTotal:") { info.RAMTotal = fmt.Sprintf("%.1f GB", toGB(f[1])) }
-			if strings.HasPrefix(l, "MemAvailable:") { info.RAMFree = fmt.Sprintf("%.1f GB", toGB(f[1])) }
-		}
-		info.RAMUsed = fmt.Sprintf("%.1f GB", toGB(parseField("/proc/meminfo", "MemTotal:")) - toGB(parseField("/proc/meminfo", "MemAvailable:")))
-		info.RAMPercent = fmt.Sprintf("%.0f%%", (toGB(parseField("/proc/meminfo", "MemTotal:")) - toGB(parseField("/proc/meminfo", "MemAvailable:"))) / toGB(parseField("/proc/meminfo", "MemTotal:")) * 100)
-	}
-	
-	if d, err := exec.Command("df", "-h", "--total").CombinedOutput(); err == nil {
-		for _, l := range strings.Split(string(d), "\n") {
-			if strings.HasPrefix(l, "total") {
-				f := strings.Fields(l)
-				if len(f) >= 4 {
-					info.StorageTotal = f[1]
-					info.StorageUsed = f[2]
-					info.StorageFree = f[3]
-				}
-			}
-		}
-	}
-	
-	if d, err := ioutil.ReadFile("/proc/loadavg"); err == nil {
-		info.LoadAvg = strings.Fields(string(d))[0]
-	}
-	
-	if d, err := ioutil.ReadDir("/proc"); err == nil {
-		for _, f := range d {
-			if f.IsDir() {
-				if _, e := strconv.Atoi(f.Name()); e == nil { info.Processes++ }
-			}
-		}
-	}
-	
-	info.OS = readOSRelease()
-	info.Kernel, _ = exec.Command("uname", "-r").CombinedOutput()
-	info.Kernel = strings.TrimSpace(info.Kernel)
-	
-	writeJSON(w, info)
+	info.Uptime = readUptime()
+	info.CPU = readCPUModel()
+	info.CPUCores = countCPUCores()
+	info.RAMTotal, info.RAMUsed, info.RAMFree, info.RAMPercent = readMemory()
+	info.StorageTotal, info.StorageUsed, info.StorageFree = readDisk()
+	info.LoadAvg = readLoadAvg()
+	info.Processes = countProcesses()
+	info.OS = readOS()
+	info.Kernel = readKernel()
+	mu.RUnlock()
+	writeJSON(w, 200, info)
 }
 
 func apiSystemCPU(w http.ResponseWriter, r *http.Request) {
 	d, err := ioutil.ReadFile("/proc/stat")
-	if err != nil { writeJSON(w, map[string]string{"error": err.Error()}); return }
-	
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	var user, nice, system, idle int
 	for _, l := range strings.Split(string(d), "\n") {
 		if strings.HasPrefix(l, "cpu ") {
@@ -434,134 +447,291 @@ func apiSystemCPU(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	total := user + nice + system + idle
-	usage := float64(user+system) / float64(total) * 100
-	
-	writeJSON(w, map[string]interface{}{
-		"usage":  fmt.Sprintf("%.1f", usage),
-		"cores":  runtimeCPUCount(),
-		"user":   user, "system": system, "idle": idle,
+	usage := 0.0
+	if total > 0 {
+		usage = float64(user+system) / float64(total) * 100
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"usage": fmt.Sprintf("%.1f", usage),
+		"cores": countCPUCores(),
+		"user":  user, "system": system, "idle": idle, "total": total,
 	})
 }
 
 func apiSystemMemory(w http.ResponseWriter, r *http.Request) {
-	total := parseField("/proc/meminfo", "MemTotal:")
-	free := parseField("/proc/meminfo", "MemAvailable:")
-	used := total - free
-	writeJSON(w, map[string]interface{}{
-		"total":     fmt.Sprintf("%.1f", toGB(total)),
-		"used":      fmt.Sprintf("%.1f", toGB(used)),
-		"free":      fmt.Sprintf("%.1f", toGB(free)),
-		"percent":   fmt.Sprintf("%.0f", float64(used)/float64(total)*100),
+	t, u, f, p := readMemory()
+	writeJSON(w, 200, map[string]string{
+		"total": t, "used": u, "free": f, "percent": p,
 	})
 }
 
 func apiSystemDisk(w http.ResponseWriter, r *http.Request) {
 	d, err := exec.Command("df", "-h").CombinedOutput()
-	if err != nil { writeJSON(w, map[string]string{"error": err.Error()}); return }
-	
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	var disks []map[string]string
-	lines := strings.Split(string(d), "\n")
-	for _, l := range lines[1:] {
+	for _, l := range strings.Split(string(d), "\n")[1:] {
 		f := strings.Fields(l)
 		if len(f) >= 6 {
 			disks = append(disks, map[string]string{
 				"filesystem": f[0], "size": f[1], "used": f[2],
-				"avail": f[3], "use%": f[4], "mounted": f[5],
+				"avail": f[3], "use_percent": f[4], "mounted": f[5],
 			})
 		}
 	}
-	writeJSON(w, disks)
+	if disks == nil {
+		disks = []map[string]string{}
+	}
+	writeJSON(w, 200, disks)
 }
 
 func apiSystemProcesses(w http.ResponseWriter, r *http.Request) {
 	d, err := exec.Command("ps", "aux", "--sort=-%cpu").CombinedOutput()
-	if err != nil { writeJSON(w, []ProcessInfo{}); return }
-	
-	var procs []ProcessInfo
-	lines := strings.Split(string(d), "\n")
-	for _, l := range lines[1:] {
+	if err != nil {
+		writeJSON(w, 200, []map[string]interface{}{})
+		return
+	}
+	type proc struct {
+		PID   int    `json:"pid"`
+		Name  string `json:"name"`
+		CPU   string `json:"cpu"`
+		RAM   string `json:"ram"`
+		State string `json:"state"`
+	}
+	var procs []proc
+	for _, l := range strings.Split(string(d), "\n")[1:] {
 		f := strings.Fields(l)
 		if len(f) >= 11 {
 			pid, _ := strconv.Atoi(f[1])
-			if pid == 0 { continue }
-			procs = append(procs, ProcessInfo{
-				PID: pid, Name: f[10], CPU: f[2], RAM: f[3], State: f[7],
-			})
+			if pid == 0 {
+				continue
+			}
+			procs = append(procs, proc{PID: pid, Name: f[10], CPU: f[2], RAM: f[3], State: f[7]})
 		}
-		if len(procs) >= 20 { break }
+		if len(procs) >= 30 {
+			break
+		}
 	}
-	writeJSON(w, procs)
+	if procs == nil {
+		procs = []proc{}
+	}
+	writeJSON(w, 200, procs)
 }
 
 func apiSystemNetwork(w http.ResponseWriter, r *http.Request) {
 	d, err := exec.Command("ss", "-tlnp").CombinedOutput()
-	if err != nil { writeJSON(w, map[string]string{"error": err.Error()}); return }
-	
+	if err != nil {
+		writeJSON(w, 200, []map[string]string{})
+		return
+	}
 	var ports []map[string]string
-	lines := strings.Split(string(d), "\n")
-	for _, l := range lines[1:] {
+	for _, l := range strings.Split(string(d), "\n")[1:] {
 		f := strings.Fields(l)
 		if len(f) >= 5 {
 			parts := strings.Split(f[3], ":")
 			port := parts[len(parts)-1]
+			pid := "N/A"
+			if len(f) >= 6 {
+				pid = f[5]
+			}
 			ports = append(ports, map[string]string{
-				"proto": f[0], "address": f[3],
-				"state": f[1], "port": port,
+				"proto": f[0], "address": f[3], "state": f[1],
+				"port": port, "pid": pid,
 			})
 		}
 	}
-	writeJSON(w, ports)
+	if ports == nil {
+		ports = []map[string]string{}
+	}
+	writeJSON(w, 200, ports)
 }
 
 func apiFirewall(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
-		var req struct { Action string `json:"action"`; Port int `json:"port"`; Protocol string `json:"protocol"` }
-		json.NewDecoder(r.Body).Decode(&req)
-		
+		var req struct {
+			Action   string `json:"action"`
+			Port     int    `json:"port"`
+			Protocol string `json:"protocol"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Action == "" || req.Port == 0 {
+			writeError(w, 400, "action, port, protocol required")
+			return
+		}
+		if req.Protocol == "" {
+			req.Protocol = "tcp"
+		}
 		cmd := exec.Command("ufw", req.Action, fmt.Sprintf("%d/%s", req.Port, req.Protocol))
-		cmd.CombinedOutput()
-		writeJSON(w, map[string]string{"status": "ok", "message": fmt.Sprintf("%s %d/%s", req.Action, req.Port, req.Protocol)})
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			writeError(w, 500, string(out))
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok", "message": fmt.Sprintf("%s %d/%s", req.Action, req.Port, req.Protocol)})
 		return
 	}
-	
-	d, err := exec.Command("ufw", "status").CombinedOutput()
-	writeJSON(w, map[string]string{"status": string(d)})
-	if err != nil { writeJSON(w, map[string]string{"status": "error: " + err.Error()}) }
+	d, err := exec.Command("ufw", "status", "numbered").CombinedOutput()
+	if err != nil {
+		writeJSON(w, 200, map[string]string{"status": "not enabled"})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": string(d)})
 }
 
 func apiUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { writeJSON(w, map[string]string{"error": "POST required"}); return }
-	
-	exec.Command("apt-get", "update").CombinedOutput()
-	writeJSON(w, map[string]string{"status": "ok", "message": "Update completed"})
+	if r.Method != "POST" {
+		writeError(w, 405, "post required")
+		return
+	}
+	go func() {
+		exec.Command("apt-get", "update", "-qq").CombinedOutput()
+		exec.Command("apt-get", "upgrade", "-y", "-qq").CombinedOutput()
+	}()
+	writeJSON(w, 200, map[string]string{"status": "ok", "message": "update started"})
 }
 
 func apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	d, err := exec.Command("apt-get", "-s", "upgrade").CombinedOutput()
-	if err != nil { writeJSON(w, map[string]string{"error": err.Error()}); return }
-	
-	lines := strings.Split(string(d), "\n")
-	var updates int
-	for _, l := range lines {
+	if err != nil {
+		writeJSON(w, 200, map[string]interface{}{"updates": 0, "available": false})
+		return
+	}
+	var updateCount int
+	for _, l := range strings.Split(string(d), "\n") {
 		if strings.Contains(l, "upgraded") || strings.Contains(l, "upgradable") {
-			fmt.Sscanf(l, "%d", &updates)
+			fmt.Sscanf(l, "%d", &updateCount)
+			break
 		}
 	}
-	writeJSON(w, map[string]interface{}{
-		"updates": updates, "available": updates > 0,
+	writeJSON(w, 200, map[string]interface{}{
+		"updates":   updateCount,
+		"available": updateCount > 0,
 	})
 }
 
-// ---- Helpers ----
+// System probes
 
-func writeJSON(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+func readUptime() string {
+	d, err := ioutil.ReadFile("/proc/uptime")
+	if err != nil {
+		return "N/A"
+	}
+	var u float64
+	fmt.Sscanf(string(d), "%f", &u)
+	days := int(u) / 86400
+	hours := (int(u) % 86400) / 3600
+	mins := (int(u) % 3600) / 60
+	return fmt.Sprintf("%dd %dh %dm", days, hours, mins)
 }
 
-func parseField(path, prefix string) float64 {
-	d, err := ioutil.ReadFile(path)
-	if err != nil { return 0 }
+func readCPUModel() string {
+	d, err := ioutil.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return "N/A"
+	}
+	for _, l := range strings.Split(string(d), "\n") {
+		if strings.Contains(l, "model name") {
+			return strings.TrimSpace(strings.SplitN(l, ":", 2)[1])
+		}
+	}
+	return "N/A"
+}
+
+func countCPUCores() int {
+	d, err := ioutil.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, l := range strings.Split(string(d), "\n") {
+		if strings.HasPrefix(l, "processor") {
+			count++
+		}
+	}
+	return count
+}
+
+func readMemory() (total, used, free, percent string) {
+	t := parseMem("MemTotal:")
+	a := parseMem("MemAvailable:")
+	if t <= 0 {
+		return "N/A", "N/A", "N/A", "N/A"
+	}
+	u := t - a
+	total = fmt.Sprintf("%.1f GB", t/1024/1024)
+	used = fmt.Sprintf("%.1f GB", u/1024/1024)
+	free = fmt.Sprintf("%.1f GB", a/1024/1024)
+	percent = fmt.Sprintf("%.0f%%", u/t*100)
+	return
+}
+
+func readDisk() (total, used, free string) {
+	d, err := exec.Command("df", "-h", "--total").CombinedOutput()
+	if err != nil {
+		return "N/A", "N/A", "N/A"
+	}
+	for _, l := range strings.Split(string(d), "\n") {
+		if strings.HasPrefix(l, "total") {
+			f := strings.Fields(l)
+			if len(f) >= 4 {
+				return f[1], f[2], f[3]
+			}
+		}
+	}
+	return "N/A", "N/A", "N/A"
+}
+
+func readLoadAvg() string {
+	d, err := ioutil.ReadFile("/proc/loadavg")
+	if err != nil {
+		return "N/A"
+	}
+	return strings.Fields(string(d))[0]
+}
+
+func countProcesses() int {
+	d, err := ioutil.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, f := range d {
+		if f.IsDir() {
+			if _, e := strconv.Atoi(f.Name()); e == nil {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func readOS() string {
+	d, err := ioutil.ReadFile("/etc/os-release")
+	if err != nil {
+		return "N/A"
+	}
+	for _, l := range strings.Split(string(d), "\n") {
+		if strings.HasPrefix(l, "PRETTY_NAME=") {
+			return strings.Trim(strings.SplitN(l, "=", 2)[1], "\"")
+		}
+	}
+	return "N/A"
+}
+
+func readKernel() string {
+	d, err := exec.Command("uname", "-r").CombinedOutput()
+	if err != nil {
+		return "N/A"
+	}
+	return strings.TrimSpace(string(d))
+}
+
+func parseMem(prefix string) float64 {
+	d, err := ioutil.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
 	for _, l := range strings.Split(string(d), "\n") {
 		if strings.HasPrefix(l, prefix) {
 			f := strings.Fields(l)
@@ -574,74 +744,42 @@ func parseField(path, prefix string) float64 {
 	return 0
 }
 
-func toGB(kb float64) float64 {
-	return kb / 1024 / 1024
+func probeUptime(ip string) string {
+	if ip == "127.0.0.1" {
+		return readUptime()
+	}
+	return "N/A"
 }
 
-func readOSRelease() string {
-	d, err := ioutil.ReadFile("/etc/os-release")
-	if err != nil { return "unknown" }
-	for _, l := range strings.Split(string(d), "\n") {
-		if strings.HasPrefix(l, "PRETTY_NAME=") {
-			return strings.Trim(strings.Split(l, "=")[1], "\"")
+func probeCPU(ip string) string {
+	if ip == "127.0.0.1" {
+		c := readCPUModel()
+		if len(c) > 30 {
+			c = c[:30] + "..."
 		}
-	}
-	return "unknown"
-}
-
-func getServerUptime(ip string) string {
-	if ip == "127.0.0.1" {
-		d, err := ioutil.ReadFile("/proc/uptime")
-		if err != nil { return "N/A" }
-		var u float64; fmt.Sscanf(string(d), "%f", &u)
-		return fmt.Sprintf("%.0fs", u)
+		return c
 	}
 	return "N/A"
 }
 
-func getServerCPU(ip string) string {
+func probeRAM(ip string) string {
 	if ip == "127.0.0.1" {
-		d, err := ioutil.ReadFile("/proc/cpuinfo")
-		if err != nil { return "N/A" }
-		for _, l := range strings.Split(string(d), "\n") {
-			if strings.Contains(l, "model name") {
-				return strings.TrimSpace(strings.Split(l, ":")[1])
-			}
-		}
+		t, _, _, _ := readMemory()
+		return t
 	}
 	return "N/A"
 }
 
-func getServerRAM(ip string) string {
+func probeStorage(ip string) string {
 	if ip == "127.0.0.1" {
-		t := parseField("/proc/meminfo", "MemTotal:")
-		return fmt.Sprintf("%.1f GB", toGB(t))
+		t, _, _ := readDisk()
+		return t
 	}
 	return "N/A"
 }
 
-func getServerStorage(ip string) string {
-	if ip == "127.0.0.1" {
-		d, err := exec.Command("df", "-h", "/").CombinedOutput()
-		if err != nil { return "N/A" }
-		f := strings.Fields(strings.Split(string(d), "\n")[1])
-		if len(f) >= 3 { return f[1] }
-	}
-	return "N/A"
-}
-
-func runtimeCPUCount() int {
-	return len(strings.Split(readFile("/proc/cpuinfo"), "\n"))
-}
-
-func readFile(path string) string {
-	d, err := ioutil.ReadFile(path)
-	if err != nil { return "" }
-	return string(d)
-}
-
-func init() {
-	log.SetFlags(log.Ldate | log.Ltime)
+func runtimeVersion() string {
+	return "go1.22.2"
 }
 GOEOF
 
@@ -649,289 +787,111 @@ GOEOF
 }
 
 write_frontend() {
-    log_info "Writing TypeScript frontend..."
+    log_info "Writing frontend..."
 
     mkdir -p "$INSTALL_DIR/frontend/src"
-    
-    cat > "$INSTALL_DIR/frontend/index.html" << 'HTMLEOF'
+
+    cat > "$INSTALL_DIR/frontend/index.html" << 'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cadix Panel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1923; color: #e0e0e0; min-height: 100vh; }
-        .sidebar { width: 240px; background: #1a2332; min-height: 100vh; position: fixed; left: 0; top: 0; }
-        .content { margin-left: 240px; padding: 24px; }
-        .stat-card { background: #1a2332; border: 1px solid #2a3a4a; border-radius: 12px; padding: 20px; transition: all .2s; }
-        .stat-card:hover { border-color: #4a9eff; transform: translateY(-2px); }
-        .stat-value { font-size: 28px; font-weight: 700; color: #fff; }
-        .stat-label { font-size: 13px; color: #8899aa; margin-top: 4px; }
-        .stat-icon { width: 48px; height: 48px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 24px; }
-        .badge-online { background: #1a3a2a; color: #4ade80; padding: 4px 12px; border-radius: 20px; font-size: 12px; }
-        .badge-offline { background: #3a1a1a; color: #f87171; padding: 4px 12px; border-radius: 20px; font-size: 12px; }
-        .nav-item { padding: 12px 20px; color: #8899aa; cursor: pointer; transition: all .2s; }
-        .nav-item:hover, .nav-item.active { background: #2a3a4a; color: #fff; }
-        .nav-item i { margin-right: 12px; width: 20px; }
-        table { width: 100%; }
-        th { color: #8899aa; font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #2a3a4a; padding: 12px 8px; }
-        td { padding: 12px 8px; border-bottom: 1px solid #1a2332; }
-        .btn-sm { font-size: 12px; padding: 4px 12px; }
-        .modal-content { background: #1a2332; border: 1px solid #2a3a4a; }
-        .modal-header { border-bottom: 1px solid #2a3a4a; }
-        .modal-footer { border-top: 1px solid #2a3a4a; }
-        .form-control, .form-select { background: #0f1923; border: 1px solid #2a3a4a; color: #fff; }
-        .form-control:focus { background: #0f1923; border-color: #4a9eff; color: #fff; box-shadow: none; }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: #0f1923; }
-        ::-webkit-scrollbar-thumb { background: #2a3a4a; border-radius: 3px; }
-        .progress { background: #0f1923; height: 6px; }
-        .progress-bar { background: linear-gradient(90deg, #4a9eff, #7c5cfc); }
-        @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .5 } }
-        .loading { animation: pulse 1.5s infinite; }
-        .section-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #fff; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cadix Panel</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+<style>
+:root{--bg:#0f1923;--surface:#1a2332;--border:#2a3a4a;--text:#e0e0e0;--muted:#8899aa;--primary:#4a9eff;--success:#4ade80;--danger:#f87171;--warning:#fbbf24}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.sidebar{width:240px;background:var(--surface);position:fixed;top:0;left:0;bottom:0;z-index:100}
+.main{margin-left:240px;padding:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;transition:.15s}
+.card:hover{border-color:var(--primary)}
+.val{font-size:28px;font-weight:700;color:#fff}
+.lbl{font-size:13px;color:var(--muted);margin-top:4px}
+.icon-box{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px}
+.badge-online,.badge-offline{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600}
+.badge-online{background:rgba(74,222,128,.15);color:var(--success)}
+.badge-offline{background:rgba(248,113,113,.15);color:var(--danger)}
+.nav-item{padding:12px 20px;color:var(--muted);cursor:pointer;transition:.15s;display:flex;align-items:center;gap:12px}
+.nav-item:hover,.nav-item.active{background:var(--bg);color:#fff}
+.nav-item i{width:20px}
+table{width:100%}
+th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border);padding:12px 8px}
+td{padding:12px 8px;border-bottom:1px solid var(--border)}
+.section-title{font-size:18px;font-weight:600;margin-bottom:16px;color:#fff}
+.progress{background:var(--bg);height:8px;border-radius:4px}
+.progress-bar{background:linear-gradient(90deg,var(--primary),#7c5cfc);border-radius:4px}
+.form-control,.form-select{background:var(--bg);border:1px solid var(--border);color:#fff;border-radius:8px}
+.form-control:focus{background:var(--bg);border-color:var(--primary);color:#fff;box-shadow:none}
+.form-control::placeholder{color:#556}
+.modal-content{background:var(--surface);border:1px solid var(--border)}
+.modal-header,.modal-footer{border-color:var(--border)}
+.btn{font-size:13px;border-radius:8px;padding:8px 16px}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .6s linear infinite;display:inline-block}
+.empty{text-align:center;padding:40px;color:var(--muted)}
+</style>
 </head>
 <body>
+
 <div class="sidebar p-3">
     <div class="d-flex align-items-center mb-4 px-3 pt-2">
-        <i class="bi bi-grid-3x3-gap-fill fs-4" style="color:#4a9eff"></i>
-        <span class="ms-2 fw-bold fs-5">Cadix Panel</span>
+        <div class="icon-box me-2" style="background:rgba(74,158,255,.15);color:var(--primary);width:36px;height:36px;font-size:18px"><i class="bi bi-grid-3x3-gap-fill"></i></div>
+        <span class="fw-bold fs-5">Cadix Panel</span>
     </div>
-    <div class="nav-item active" onclick="showPage('dashboard')"><i class="bi bi-speedometer2"></i> Dashboard</div>
-    <div class="nav-item" onclick="showPage('servers')"><i class="bi bi-server"></i> Servers</div>
-    <div class="nav-item" onclick="showPage('system')"><i class="bi bi-cpu"></i> System</div>
-    <div class="nav-item" onclick="showPage('network')"><i class="bi bi-diagram-3"></i> Network</div>
-    <div class="nav-item" onclick="showPage('processes')"><i class="bi bi-list-task"></i> Processes</div>
-    <div class="nav-item" onclick="showPage('updates')"><i class="bi bi-arrow-up-circle"></i> Updates</div>
-    <div style="position:absolute;bottom:20px;left:20px;right:20px;padding:12px 16px;background:#0f1923;border-radius:8px">
+    <div class="nav-item active" data-page="dashboard"><i class="bi bi-speedometer2"></i> Dashboard</div>
+    <div class="nav-item" data-page="servers"><i class="bi bi-server"></i> Servers</div>
+    <div class="nav-item" data-page="system"><i class="bi bi-cpu"></i> System</div>
+    <div class="nav-item" data-page="network"><i class="bi bi-diagram-3"></i> Network</div>
+    <div class="nav-item" data-page="processes"><i class="bi bi-list-task"></i> Processes</div>
+    <div class="nav-item" data-page="updates"><i class="bi bi-arrow-up-circle"></i> Updates</div>
+    <div class="nav-item" data-page="firewall"><i class="bi bi-shield-check"></i> Firewall</div>
+    <div style="position:absolute;bottom:20px;left:20px;right:20px;background:var(--bg);border-radius:8px;padding:12px 16px" id="statusBar">
         <div class="d-flex align-items-center">
-            <div style="width:10px;height:10px;border-radius:50%;background:#4ade80" id="statusDot"></div>
-            <span class="ms-2" style="font-size:13px;color:#8899aa"><span id="panelStatus">Loading...</span></span>
+            <div style="width:10px;height:10px;border-radius:50%;background:var(--success)" id="statusDot"></div>
+            <span class="ms-2" style="font-size:12px;color:var(--muted)"><span id="panelStatus">Loading...</span></span>
         </div>
     </div>
 </div>
-<div class="content" id="mainContent"></div>
+
+<div class="main" id="content">
+    <div class="d-flex justify-content-center align-items-center" style="min-height:60vh">
+        <div style="text-align:center"><div class="spinner mb-3"></div><div style="color:var(--muted)">Loading Cadix Panel...</div></div>
+    </div>
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 const API = '';
 let state = { servers: [], system: {} };
 
-async function api(path, opts = {}) {
-    const r = await fetch(API + path, {
-        headers: { 'Content-Type': 'application/json', ...opts.headers },
-        ...opts
+function qs(s,p){return s.querySelector(p)}
+function qsa(s,p){return s.querySelectorAll(p)}
+function $id(id){return document.getElementById(id)}
+
+async function api(path, opts={}) {
+    const res = await fetch(API+path, {
+        headers: {'Content-Type':'application/json',...opts.headers}, ...opts
     });
-    return r.json();
+    if (!res.ok) { const e=await res.json().catch(()=>({})); throw new Error(e.error||res.statusText); }
+    return res.json();
 }
 
-function $(id) { return document.getElementById(id); }
-
-function renderDashboard() {
-    const s = state.system;
-    return \`
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <div><h2 class="fw-bold mb-1">Dashboard</h2><p style="color:#8899aa">System overview</p></div>
-        <div><span style="color:#8899aa;font-size:13px">\${s.hostname || 'N/A'} &middot; v2.0.0</span></div>
-    </div>
-    <div class="row g-3 mb-4">
-        <div class="col-md-3"><div class="stat-card d-flex align-items-center">
-            <div class="stat-icon me-3" style="background:#1a2a4a;color:#4a9eff"><i class="bi bi-cpu"></i></div>
-            <div><div class="stat-value">\${state.servers.length || 0}</div><div class="stat-label">Total Servers</div></div>
-        </div></div>
-        <div class="col-md-3"><div class="stat-card d-flex align-items-center">
-            <div class="stat-icon me-3" style="background:#1a3a2a;color:#4ade80"><i class="bi bi-memory"></i></div>
-            <div><div class="stat-value">\${s.ram_total || 'N/A'}</div><div class="stat-label">Total RAM</div></div>
-        </div></div>
-        <div class="col-md-3"><div class="stat-card d-flex align-items-center">
-            <div class="stat-icon me-3" style="background:#3a2a1a;color:#fbbf24"><i class="bi bi-hdd"></i></div>
-            <div><div class="stat-value">\${s.storage_total || 'N/A'}</div><div class="stat-label">Storage</div></div>
-        </div></div>
-        <div class="col-md-3"><div class="stat-card d-flex align-items-center">
-            <div class="stat-icon me-3" style="background:#2a1a3a;color:#c084fc"><i class="bi bi-arrow-up"></i></div>
-            <div><div class="stat-value">\${s.uptime || 'N/A'}</div><div class="stat-label">Uptime</div></div>
-        </div></div>
-    </div>
-    <div class="row g-3">
-        <div class="col-md-6"><div class="stat-card">
-            <div class="d-flex justify-content-between mb-2"><span>CPU Usage</span><span>\${s.load_avg || '0'}%</span></div>
-            <div class="progress"><div class="progress-bar" style="width:\${Math.min(parseFloat(s.load_avg||0)*10,100)}%"></div></div>
-        </div></div>
-        <div class="col-md-6"><div class="stat-card">
-            <div class="d-flex justify-content-between mb-2"><span>RAM Usage</span><span>\${s.ram_percent || '0'}</span></div>
-            <div class="progress"><div class="progress-bar" style="width:\${parseFloat(s.ram_percent||0)}%"></div></div>
-        </div></div>
-    </div>\`;
-}
-
-function renderServers() {
-    return \`
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <div><h2 class="fw-bold mb-1">Servers</h2><p style="color:#8899aa">\${state.servers.length} total</p></div>
-        <button class="btn btn-primary btn-sm" onclick="showAddServer()"><i class="bi bi-plus-lg"></i> Add Server</button>
-    </div>
-    <div class="stat-card p-0">
-    <table><thead><tr><th>Name</th><th>IP</th><th>Status</th><th>Uptime</th><th>CPU</th><th>RAM</th><th>Actions</th></tr></thead>
-    <tbody>\${state.servers.map(s => \`
-        <tr><td>\${s.name}</td><td>\${s.ip}</td>
-        <td><span class="badge-\${s.status}">\${s.status.toUpperCase()}</span></td>
-        <td>\${s.uptime || 'N/A'}</td><td>\${s.cpu ? s.cpu.substring(0,20) : 'N/A'}</td>
-        <td>\${s.ram || 'N/A'}</td>
-        <td>
-            <button class="btn btn-success btn-sm me-1" onclick="serverAction(\${s.id},'start')"><i class="bi bi-play-fill"></i></button>
-            <button class="btn btn-danger btn-sm me-1" onclick="serverAction(\${s.id},'stop')"><i class="bi bi-stop-fill"></i></button>
-            <button class="btn btn-warning btn-sm me-1" onclick="serverAction(\${s.id},'restart')"><i class="bi bi-arrow-clockwise"></i></button>
-            <button class="btn btn-outline-danger btn-sm" onclick="removeServer(\${s.id})"><i class="bi bi-trash"></i></button>
-        </td></tr>
-    \`).join('')}</tbody></table></div>\`;
-}
-
-function renderSystem() {
-    const s = state.system;
-    return \`
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <div><h2 class="fw-bold mb-1">System Info</h2><p style="color:#8899aa">Hardware & OS details</p></div>
-        <button class="btn btn-outline-info btn-sm" onclick="refreshSystem()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
-    </div>
-    <div class="row g-3">
-        <div class="col-md-6"><div class="stat-card">
-            <div class="section-title">Hardware</div>
-            <table><tbody>
-                <tr><td style="color:#8899aa">Hostname</td><td>\${s.hostname || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">CPU</td><td>\${s.cpu || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">CPU Cores</td><td>\${s.cpu_cores || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">RAM Total</td><td>\${s.ram_total || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">RAM Used</td><td>\${s.ram_used || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">RAM Free</td><td>\${s.ram_free || 'N/A'}</td></tr>
-            </tbody></table>
-        </div></div>
-        <div class="col-md-6"><div class="stat-card">
-            <div class="section-title">OS & Kernel</div>
-            <table><tbody>
-                <tr><td style="color:#8899aa">Operating System</td><td>\${s.os || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">Kernel</td><td>\${s.kernel || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">Uptime</td><td>\${s.uptime || 'N/A'}</td></tr>
-                <tr><td style="color:#8899aa">Load Average</td><td>\${s.load_avg || 'N/A'}</td></tr>
-            </tbody></table>
-        </div></div>
-    </div>\`;
-}
-
-function renderNetwork() {
-    return \`<p>Network info loading...</p>\`;
-}
-
-function renderProcesses() {
-    api('/api/system/processes').then(p => {
-        const el = $('mainContent');
-        if (p.error) { el.innerHTML = '<p class="text-danger">Error loading processes</p>'; return; }
-        el.innerHTML = \`
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <div><h2 class="fw-bold mb-1">Processes</h2><p style="color:#8899aa">Top 20 by CPU usage</p></div>
-            <span style="color:#8899aa;font-size:13px">\${p.length} processes</span>
-        </div>
-        <div class="stat-card p-0">
-        <table><thead><tr><th>PID</th><th>Name</th><th>CPU%</th><th>RAM%</th><th>State</th></tr></thead>
-        <tbody>\${p.map(pr => \`<tr><td>\${pr.pid}</td><td>\${pr.name}</td><td>\${pr.cpu}%</td><td>\${pr.ram}%</td><td>\${pr.state}</td></tr>\`).join('')}</tbody></table></div>\`;
-    });
-    return '<div class="loading" style="text-align:center;padding:40px">Loading processes...</div>';
-}
-
-function renderUpdates() {
-    api('/api/update/check').then(u => {
-        const el = $('mainContent');
-        el.innerHTML = \`
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <div><h2 class="fw-bold mb-1">Updates</h2><p style="color:#8899aa">Package management</p></div>
-            <button class="btn btn-primary btn-sm" onclick="runUpdate()"><i class="bi bi-arrow-up-circle"></i> Update All</button>
-        </div>
-        <div class="stat-card">
-            <div class="d-flex align-items-center mb-3">
-                <i class="bi bi-box-seam fs-3 me-3" style="color:\${u.available ? '#fbbf24' : '#4ade80'}"></i>
-                <div><div style="font-size:24px;font-weight:700">\${u.updates || 0}</div><div style="color:#8899aa">Updates Available</div></div>
-            </div>
-            \${u.available ? \`<div class="alert alert-warning mb-0" style="background:#3a2a1a;border:1px solid #5a4a2a;color:#fbbf24;font-size:13px">Updates are available. Click "Update All" to install.</div>\` : \`<div class="alert alert-success mb-0" style="background:#1a3a2a;border:1px solid #2a5a3a;color:#4ade80;font-size:13px">System is up to date.</div>\`}
-        </div>\`;
-    });
-    return '<div class="loading" style="text-align:center;padding:40px">Checking updates...</div>';
-}
-
-function getServerByID(id) { return state.servers.find(s => s.id === id); }
-
-function showPage(page) {
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    event?.target?.closest('.nav-item')?.classList?.add('active');
-    
-    const pages = { dashboard: renderDashboard, servers: renderServers, system: renderSystem, network: renderNetwork, processes: renderProcesses, updates: renderUpdates };
-    const render = pages[page] || pages.dashboard;
-    const res = render();
-    if (typeof res === 'string') $('mainContent').innerHTML = res;
-}
-
-function showAddServer() {
-    const modal = document.createElement('div');
-    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1050';
-    modal.innerHTML = \`
-    <div style="background:#1a2332;border-radius:12px;padding:24px;width:480px;border:1px solid #2a3a4a">
-        <h5 class="mb-3 fw-bold">Add Server</h5>
-        <div class="mb-3"><label style="color:#8899aa;font-size:13px;margin-bottom:4px">Name</label>
-        <input class="form-control form-control-sm" id="addName" placeholder="My Server" value="Server \${state.servers.length+1}"></div>
-        <div class="mb-3"><label style="color:#8899aa;font-size:13px;margin-bottom:4px">IP Address</label>
-        <input class="form-control form-control-sm" id="addIP" placeholder="192.168.1.100" value="\${state.servers.length === 0 ? '127.0.0.1' : '10.0.0.'+(state.servers.length+1)}"></div>
-        <div class="row g-2 mb-3">
-            <div class="col"><label style="color:#8899aa;font-size:13px;margin-bottom:4px">Port</label>
-            <input class="form-control form-control-sm" id="addPort" value="22"></div>
-            <div class="col"><label style="color:#8899aa;font-size:13px;margin-bottom:4px">Username</label>
-            <input class="form-control form-control-sm" id="addUser" value="root"></div>
-        </div>
-        <div class="d-flex justify-content-end gap-2">
-            <button class="btn btn-outline-secondary btn-sm" onclick="this.closest('div[style]').remove()">Cancel</button>
-            <button class="btn btn-primary btn-sm" onclick="addServer()">Add Server</button>
-        </div>
-    </div>\`;
-    modal.dataset.modal = 'true';
-    modal.onclick = e => { if (e.target === modal) modal.remove(); };
-    document.body.appendChild(modal);
-}
-
-async function addServer() {
-    const name = $('addName')?.value;
-    const ip = $('addIP')?.value;
-    if (!name || !ip) return;
-    await api('/api/servers/add', { method: 'POST', body: JSON.stringify({name, ip, port: parseInt($('addPort')?.value || '22'), username: $('addUser')?.value || 'root'}) });
-    document.querySelector('[data-modal]')?.remove();
-    loadData();
-}
-
-async function removeServer(id) {
-    if (!confirm('Remove server?')) return;
-    await api('/api/servers/remove', { method: 'POST', body: JSON.stringify({id}) });
-    loadData();
-}
-
-async function serverAction(id, action) {
-    await api('/api/servers/' + action, { method: 'POST', body: JSON.stringify({id}) });
-    loadData();
-}
-
-async function runUpdate() {
-    const btn = event?.target?.closest('button');
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Updating...'; }
-    await api('/api/update', { method: 'POST' });
-    showPage('updates');
-}
-
-async function refreshSystem() {
-    const btn = event?.target?.closest('button');
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>'; }
-    await loadData();
-    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh'; }
-    showPage('system');
+function showPage(name) {
+    qsa(document,'.nav-item').forEach(n=>n.classList.remove('active'));
+    const nav = document.querySelector(`[data-page="${name}"]`);
+    if (nav) nav.classList.add('active');
+    const renderers = { dashboard:renderDashboard, servers:renderServers, system:renderSystem,
+        network:renderNetwork, processes:renderProcesses, updates:renderUpdates, firewall:renderFirewall };
+    const fn = renderers[name] || renderDashboard;
+    const el = $id('content');
+    el.innerHTML = '<div class="d-flex justify-content-center align-items-center" style="min-height:60vh"><div class="spinner"></div></div>';
+    setTimeout(() => { try { el.innerHTML = fn(); } catch(e) { el.innerHTML = `<div class="empty">Error: ${e.message}</div>`; } }, 50);
 }
 
 async function loadData() {
@@ -941,29 +901,274 @@ async function loadData() {
         ]);
         state.servers = servers;
         state.system = system;
-        $('panelStatus').textContent = 'Connected';
-        $('statusDot').style.background = '#4ade80';
-        showPage('dashboard');
+        $id('panelStatus').textContent = `Connected v${status.version} | ${state.servers.length} servers`;
+        $id('statusDot').style.background = 'var(--success)';
     } catch(e) {
-        $('panelStatus').textContent = 'Disconnected';
-        $('statusDot').style.background = '#f87171';
-        $('mainContent').innerHTML = '<div style="text-align:center;padding:60px"><i class="bi bi-exclamation-triangle fs-1" style="color:#f87171"></i><h4 class="mt-3">Connection Error</h4><p style="color:#8899aa">Cannot connect to backend API</p><button class="btn btn-primary mt-2" onclick="loadData()">Retry</button></div>';
+        $id('panelStatus').textContent = 'Disconnected';
+        $id('statusDot').style.background = 'var(--danger)';
     }
 }
 
-loadData();
+async function loadAndRender(page) {
+    await loadData();
+    showPage(page || 'dashboard');
+}
+
+// ---- Pages ----
+
+function renderDashboard() {
+    const s = state.system;
+    return \`
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div><h2 class="fw-bold mb-1">Dashboard</h2><p style="color:var(--muted)">System overview</p></div>
+        <span style="color:var(--muted);font-size:13px">\${s.hostname||'N/A'} &middot; v2.0.0</span>
+    </div>
+    <div class="row g-3 mb-4">
+        <div class="col-md-3"><div class="card d-flex flex-row align-items-center">
+            <div class="icon-box me-3" style="background:rgba(74,158,255,.15);color:var(--primary)"><i class="bi bi-server"></i></div>
+            <div><div class="val">\${state.servers.length}</div><div class="lbl">Servers</div></div>
+        </div></div>
+        <div class="col-md-3"><div class="card d-flex flex-row align-items-center">
+            <div class="icon-box me-3" style="background:rgba(74,222,128,.15);color:var(--success)"><i class="bi bi-memory"></i></div>
+            <div><div class="val">\${s.ram_total||'N/A'}</div><div class="lbl">RAM Total</div></div>
+        </div></div>
+        <div class="col-md-3"><div class="card d-flex flex-row align-items-center">
+            <div class="icon-box me-3" style="background:rgba(251,191,36,.15);color:var(--warning)"><i class="bi bi-hdd"></i></div>
+            <div><div class="val">\${s.storage_total||'N/A'}</div><div class="lbl">Storage</div></div>
+        </div></div>
+        <div class="col-md-3"><div class="card d-flex flex-row align-items-center">
+            <div class="icon-box me-3" style="background:rgba(196,132,252,.15);color:#c084fc"><i class="bi bi-arrow-up"></i></div>
+            <div><div class="val">\${s.uptime||'N/A'}</div><div class="lbl">Uptime</div></div>
+        </div></div>
+    </div>
+    <div class="row g-3">
+        <div class="col-md-6"><div class="card">
+            <div class="d-flex justify-content-between mb-2"><span>CPU Usage</span><span>\${s.load_avg||'0'}</span></div>
+            <div class="progress"><div class="progress-bar" style="width:\${Math.min(parseFloat(s.load_avg||0)*8,100)}%"></div></div>
+        </div></div>
+        <div class="col-md-6"><div class="card">
+            <div class="d-flex justify-content-between mb-2"><span>RAM Usage</span><span>\${s.ram_percent||'0%'}</span></div>
+            <div class="progress"><div class="progress-bar" style="width:\${Math.min(parseFloat(s.ram_percent)||0,100)}%"></div></div>
+        </div></div>
+    </div>\`;
+}
+
+function renderServers() {
+    const list = state.servers;
+    return \`
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div><h2 class="fw-bold mb-1">Servers</h2><p style="color:var(--muted)">\${list.length} total</p></div>
+        <button class="btn btn-primary" onclick="showAddServer()"><i class="bi bi-plus-lg"></i> Add</button>
+    </div>
+    \${list.length === 0 ? '<div class="empty"><i class="bi bi-server fs-1 mb-3" style="display:block"></i>No servers yet</div>' : \`
+    <div class="card p-0" style="overflow-x:auto">
+    <table><thead><tr><th>Name</th><th>IP</th><th>Status</th><th>Uptime</th><th>CPU</th><th>RAM</th><th style="width:160px">Actions</th></tr></thead>
+    <tbody>\${list.map(s => \`
+        <tr><td>\${s.name}</td><td>\${s.ip}:\${s.port||22}</td>
+        <td><span class="badge-\${s.status}">\${s.status.toUpperCase()}</span></td>
+        <td>\${s.uptime||'N/A'}</td><td title="\${s.cpu}">\${s.cpu?s.cpu.substring(0,25):'N/A'}</td>
+        <td>\${s.ram||'N/A'}</td>
+        <td>
+            <button class="btn btn-sm btn-outline-success" onclick="act(\${s.id},'start')" title="Start"><i class="bi bi-play-fill"></i></button>
+            <button class="btn btn-sm btn-outline-danger" onclick="act(\${s.id},'stop')" title="Stop"><i class="bi bi-stop-fill"></i></button>
+            <button class="btn btn-sm btn-outline-warning" onclick="act(\${s.id},'restart')" title="Restart"><i class="bi bi-arrow-clockwise"></i></button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="delSrv(\${s.id})" title="Delete"><i class="bi bi-trash"></i></button>
+        </td></tr>
+    \`).join('')}</tbody></table></div>\`}\`;
+}
+
+function renderSystem() {
+    const s = state.system;
+    const rows = [
+        ['Hostname', s.hostname], ['OS', s.os], ['Kernel', s.kernel],
+        ['CPU', s.cpu], ['Cores', s.cpu_cores], ['Uptime', s.uptime],
+        ['Load Average', s.load_avg], ['Processes', s.processes],
+        ['RAM Total', s.ram_total], ['RAM Used', s.ram_used], ['RAM Free', s.ram_free],
+        ['Storage Total', s.storage_total], ['Storage Used', s.storage_used], ['Storage Free', s.storage_free]
+    ];
+    return \`
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div><h2 class="fw-bold mb-1">System</h2><p style="color:var(--muted)">Hardware & OS</p></div>
+        <button class="btn btn-outline-info" onclick="refreshSystem()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+    </div>
+    <div class="row g-3">
+        <div class="col-md-6"><div class="card">
+            <div class="section-title">Overview</div>
+            <table><tbody>\${rows.slice(0,8).map(r => \`<tr><td style="color:var(--muted);width:160px">\${r[0]}</td><td>\${r[1]||'N/A'}</td></tr>\`).join('')}</tbody></table>
+        </div></div>
+        <div class="col-md-6"><div class="card">
+            <div class="section-title">Resources</div>
+            <table><tbody>\${rows.slice(8).map(r => \`<tr><td style="color:var(--muted);width:160px">\${r[0]}</td><td>\${r[1]||'N/A'}</td></tr>\`).join('')}</tbody></table>
+        </div></div>
+    </div>\`;
+}
+
+function renderNetwork() {
+    let html = '<div class="d-flex justify-content-between align-items-center mb-4"><div><h2 class="fw-bold mb-1">Network</h2><p style="color:var(--muted)">Open ports</p></div></div>';
+    api('/api/system/network').then(p => {
+        const el = qs($id('content'),'.net-tbl');
+        if (!el) return;
+        if (p.length === 0) { el.innerHTML = '<div class="empty">No active ports</div>'; return; }
+        el.innerHTML = \`<table><thead><tr><th>Proto</th><th>Address</th><th>State</th><th>Port</th></tr></thead>
+        <tbody>\${p.map(n => \`<tr><td>\${n.proto}</td><td>\${n.address}</td><td>\${n.state}</td><td>\${n.port}</td></tr>\`).join('')}</tbody></table>\`;
+    });
+    return html + '<div class="card p-0 net-tbl"><div class="empty"><div class="spinner"></div></div></div>';
+}
+
+function renderProcesses() {
+    let html = '<div class="d-flex justify-content-between align-items-center mb-4"><div><h2 class="fw-bold mb-1">Processes</h2><p style="color:var(--muted)">Top 30 by CPU</p></div></div>';
+    api('/api/system/processes').then(p => {
+        const el = qs($id('content'),'.proc-tbl');
+        if (!el) return;
+        if (p.length === 0) { el.innerHTML = '<div class="empty">No processes</div>'; return; }
+        el.innerHTML = \`<table><thead><tr><th>PID</th><th>Name</th><th>CPU%</th><th>RAM%</th><th>State</th></tr></thead>
+        <tbody>\${p.map(pr => \`<tr><td>\${pr.pid}</td><td>\${pr.name}</td><td>\${pr.cpu}%</td><td>\${pr.ram}%</td>
+        <td><span class="badge-online">\${pr.state}</span></td></tr>\`).join('')}</tbody></table>\`;
+    });
+    return html + '<div class="card p-0 proc-tbl"><div class="empty"><div class="spinner"></div></div></div>';
+}
+
+function renderUpdates() {
+    let html = '<div class="d-flex justify-content-between align-items-center mb-4"><div><h2 class="fw-bold mb-1">Updates</h2><p style="color:var(--muted)">Package management</p></div><button class="btn btn-primary" onclick="doUpdate()"><i class="bi bi-arrow-up-circle"></i> Update All</button></div>';
+    api('/api/update/check').then(u => {
+        const el = qs($id('content'),'.upd-box');
+        if (!el) return;
+        el.innerHTML = \`
+        <div class="card">
+            <div class="d-flex align-items-center mb-3">
+                <i class="bi bi-box-seam fs-3 me-3" style="color:\${u.available?'var(--warning)':'var(--success)'}"></i>
+                <div><div class="val">\${u.updates||0}</div><div class="lbl">Updates Available</div></div>
+            </div>
+            \${u.available
+                ? '<div class="alert" style="background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.2);color:var(--warning);font-size:13px;border-radius:8px">Updates available. Click "Update All".</div>'
+                : '<div class="alert" style="background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.2);color:var(--success);font-size:13px;border-radius:8px">System up to date.</div>'}
+        </div>\`;
+    });
+    return html + '<div class="upd-box"><div class="empty"><div class="spinner"></div></div></div>';
+}
+
+function renderFirewall() {
+    let html = '<div class="d-flex justify-content-between align-items-center mb-4"><div><h2 class="fw-bold mb-1">Firewall</h2><p style="color:var(--muted)">UFW status</p></div></div>';
+    api('/api/firewall').then(fw => {
+        const el = qs($id('content'),'.fw-box');
+        if (!el) return;
+        el.innerHTML = \`<div class="card"><pre style="color:var(--muted);font-size:13px;white-space:pre-wrap">\${fw.status||'UFW not enabled'}</pre></div>\`;
+    });
+    return html + \`
+    <div class="fw-box"><div class="empty"><div class="spinner"></div></div></div>
+    <div class="card mt-3">
+        <div class="section-title">Quick Rule</div>
+        <div class="row g-2 align-items-end">
+            <div class="col"><label style="color:var(--muted);font-size:13px">Action</label>
+            <select class="form-select" id="fwAction"><option value="allow">Allow</option><option value="deny">Deny</option><option value="delete">Delete</option></select></div>
+            <div class="col"><label style="color:var(--muted);font-size:13px">Port</label>
+            <input class="form-control" id="fwPort" value="22"></div>
+            <div class="col"><label style="color:var(--muted);font-size:13px">Protocol</label>
+            <select class="form-select" id="fwProto"><option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
+            <div class="col d-grid"><button class="btn btn-primary" onclick="fwRule()">Apply</button></div>
+        </div>
+    </div>\`;
+}
+
+// ---- Actions ----
+
+async function act(id, action) {
+    const btn = event?.target?.closest('button');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+    await api('/api/servers/'+action, {method:'POST', body:JSON.stringify({id})});
+    await loadData(); showPage('servers');
+}
+
+async function delSrv(id) {
+    if (!confirm('Remove this server?')) return;
+    await api('/api/servers/remove', {method:'POST', body:JSON.stringify({id})});
+    await loadData(); showPage('servers');
+}
+
+async function refreshSystem() {
+    const btn = event?.target?.closest('button');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+    await loadData(); showPage('system');
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Refresh'; }
+}
+
+async function doUpdate() {
+    const btn = event?.target?.closest('button');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Updating...'; }
+    await api('/api/update', {method:'POST'});
+    await loadData(); showPage('updates');
+}
+
+async function fwRule() {
+    const action = $id('fwAction')?.value;
+    const port = parseInt($id('fwPort')?.value);
+    const proto = $id('fwProto')?.value;
+    if (!port) return;
+    await api('/api/firewall', {method:'POST', body:JSON.stringify({action,port,protocol:proto})});
+    showPage('firewall');
+}
+
+function showAddServer() {
+    const name = \`Server \${(state.servers.length||0)+1}\`;
+    const ip = state.servers.length === 0 ? '127.0.0.1' : \`10.0.0.\${state.servers.length+1}\`;
+    const html = \`
+    <div class="modal d-block" tabindex="-1" style="background:rgba(0,0,0,.6)">
+    <div class="modal-dialog"><div class="modal-content">
+        <div class="modal-header"><h5 class="modal-title fw-bold">Add Server</h5>
+        <button type="button" class="btn-close btn-close-white" onclick="this.closest('.modal').remove()"></button></div>
+        <div class="modal-body">
+            <div class="mb-3"><label style="color:var(--muted);font-size:13px">Name</label>
+            <input class="form-control" id="addName" value="\${name}"></div>
+            <div class="mb-3"><label style="color:var(--muted);font-size:13px">IP Address</label>
+            <input class="form-control" id="addIP" value="\${ip}"></div>
+            <div class="row g-2">
+                <div class="col"><label style="color:var(--muted);font-size:13px">Port</label>
+                <input class="form-control" id="addPort" value="22"></div>
+                <div class="col"><label style="color:var(--muted);font-size:13px">Username</label>
+                <input class="form-control" id="addUser" value="root"></div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-outline-secondary" onclick="this.closest('.modal').remove()">Cancel</button>
+            <button class="btn btn-primary" onclick="doAddServer()">Add</button>
+        </div>
+    </div></div></div>\`;
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    document.body.appendChild(div.firstElementChild);
+}
+
+async function doAddServer() {
+    const name = $id('addName')?.value;
+    const ip = $id('addIP')?.value;
+    if (!name || !ip) return;
+    await api('/api/servers/add', {method:'POST', body:JSON.stringify({
+        name, ip, port: parseInt($id('addPort')?.value||'22'), username: $id('addUser')?.value||'root'
+    })});
+    qs(document,'.modal')?.remove();
+    await loadData(); showPage('servers');
+}
+
+// ---- Init ----
+
+qsa(document,'.nav-item').forEach(n => {
+    n.addEventListener('click', () => showPage(n.dataset.page));
+});
+
+loadAndRender('dashboard');
 setInterval(loadData, 30000);
 </script>
+
 </body>
 </html>
-HTMLEOF
+EOF
 
     log_info "Frontend written"
 }
 
 write_schema() {
     log_info "Writing database schema..."
-    
+    mkdir -p "$INSTALL_DIR/backend"
     cat > "$INSTALL_DIR/backend/schema.sql" << 'SQLEOF'
 CREATE TABLE IF NOT EXISTS servers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -974,12 +1179,7 @@ CREATE TABLE IF NOT EXISTS servers (
     status TEXT DEFAULT 'offline',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
@@ -987,23 +1187,17 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT DEFAULT 'admin',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    server_id INTEGER,
-    cpu REAL,
-    ram REAL,
-    disk REAL,
+    server_id INTEGER, cpu REAL, ram REAL, disk REAL,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 SQLEOF
-
     log_info "Schema written"
 }
 
 write_tools() {
     log_info "Writing system tools..."
-
     cat > "$INSTALL_DIR/tools/monitor.sh" << 'BASHEOF'
 #!/bin/bash
 echo "=== Cadix Monitor ==="
@@ -1012,51 +1206,54 @@ echo "RAM: $(free -h | awk '/^Mem:/ {print $3 "/" $2}')"
 echo "Disk: $(df -h / | awk 'NR==2 {print $3 "/" $2}')"
 echo "Uptime: $(uptime -p | sed 's/up //')"
 echo "Load: $(cat /proc/loadavg | awk '{print $1", "$2", "$3}')"
+echo "Processes: $(ps aux | wc -l)"
+echo "Open ports: $(ss -tln | wc -l)"
 BASHEOF
+    chmod +x "$INSTALL_DIR/tools/monitor.sh"
 
     cat > "$INSTALL_DIR/tools/backup.sh" << 'BASHEOF'
 #!/bin/bash
 BACKUP_DIR="/opt/cadix-panel/data"
 FILE="panel.backup.$(date +%Y%m%d_%H%M%S).db"
 cp "$BACKUP_DIR/panel.db" "$BACKUP_DIR/$FILE"
-echo "Backup: $FILE"
+echo "Backup: $FILE ($(du -h "$BACKUP_DIR/$FILE" | awk '{print $1}'))"
 find "$BACKUP_DIR" -name "panel.backup.*.db" -mtime +7 -delete
 BASHEOF
+    chmod +x "$INSTALL_DIR/tools/backup.sh"
 
     cat > "$INSTALL_DIR/tools/cleanup.sh" << 'BASHEOF'
 #!/bin/bash
-echo "Cleaning up..."
-apt-get autoremove -y
-apt-get autoclean
-journalctl --vacuum-time=7d
+echo "Cleaning..."
+apt-get autoremove -y -qq
+apt-get autoclean -qq
+journalctl --vacuum-time=7d >/dev/null 2>&1
 find /opt/cadix-panel/logs -name "*.log" -mtime +30 -delete
 echo "Done"
 BASHEOF
+    chmod +x "$INSTALL_DIR/tools/cleanup.sh"
 
-    chmod +x "$INSTALL_DIR/tools/"*.sh
     log_info "Tools written"
 }
 
-setup_go() {
+build_go() {
     log_info "Building Go binary..."
     cd "$INSTALL_DIR/backend"
+    export PATH="/usr/local/go/bin:$PATH"
     
-    export PATH=/usr/local/go/bin:$PATH
-    go mod init cadix-panel 2>/dev/null
+    go mod init cadix-panel 2>/dev/null || true
     go mod tidy 2>/dev/null
     
-    go build -o "$INSTALL_DIR/backend/panel" . 2>&1 || {
+    if go build -o "$INSTALL_DIR/backend/panel" . 2>/dev/null; then
+        chmod +x "$INSTALL_DIR/backend/panel"
+        log_info "Go binary built at $INSTALL_DIR/backend/panel"
+    else
         log_warn "Go build failed, will use go run"
-        log_info "Creating go.sum..."
-        go mod download 2>/dev/null || true
-    }
-    log_info "Go build complete"
+    fi
 }
 
 setup_nginx() {
     log_info "Configuring nginx..."
-    
-    cat > /etc/nginx/sites-available/cadix-panel << 'NGINXCONF'
+    cat > /etc/nginx/sites-available/cadix-panel << 'NGINX'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -1064,30 +1261,29 @@ server {
     
     location / {
         proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
         proxy_buffering off;
+        proxy_read_timeout 86400;
     }
 }
-NGINXCONF
-
+NGINX
     mkdir -p /etc/nginx/sites-enabled
     ln -sf /etc/nginx/sites-available/cadix-panel /etc/nginx/sites-enabled/cadix-panel
     rm -f /etc/nginx/sites-enabled/default
-    nginx -t 2>/dev/null && systemctl restart nginx 2>/dev/null || log_warn "Nginx config issue"
+    nginx -t 2>/dev/null && systemctl restart nginx 2>/dev/null || log_warn "nginx config issue"
 }
 
 setup_systemd() {
     log_info "Creating systemd service..."
-    
     cat > /etc/systemd/system/cadix-panel.service << SVCEOF
 [Unit]
-Description=Cadix Panel - VPS Control Panel
+Description=Cadix Panel
 After=network.target
 
 [Service]
@@ -1104,7 +1300,6 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable cadix-panel 2>/dev/null || true
     systemctl restart cadix-panel 2>/dev/null || true
@@ -1133,90 +1328,83 @@ setup_firewall() {
 setup_ssl() {
     local domain="$1" email="$2"
     if [[ -n "$domain" ]]; then
-        log_info "Configuring SSL for $domain..."
+        log_info "SSL for $domain..."
         certbot --nginx -d "$domain" -d "www.$domain" \
             --email "$email" --agree-tos --redirect --non-interactive 2>/dev/null || \
-        log_warn "SSL setup had issues"
+        log_warn "SSL issue"
         log_info "SSL configured"
     fi
 }
 
-show_completion() {
-    local ip=$(hostname -I | awk '{print $1}')
-    
+show_summary() {
+    local ip
+    ip=$(hostname -I | awk '{print $1}')
     cat << EOF
 
 ========================================
   Cadix Panel v$VERSION
 ========================================
 
-Access: http://$ip
-API: http://$ip/api/status
+URL:  http://$ip
+API:  http://$ip/api/status
 
-Tech Stack:
-  Backend:  Go (Golang)
-  Frontend: TypeScript + React
-  Database: SQL (SQLite)
-  System:   Bash
+Go:   $(go version 2>/dev/null || echo "N/A")
+Node: $(node --version 2>/dev/null || echo "N/A")
 
-Commands:
+Tools:
+  /opt/cadix-panel/tools/monitor.sh
+  /opt/cadix-panel/tools/backup.sh
+  /opt/cadix-panel/tools/cleanup.sh
+
+Service:
   systemctl status cadix-panel
   journalctl -u cadix-panel -f
-  /opt/cadix-panel/tools/monitor.sh
 
 EOF
 }
 
 usage() {
-    cat << USAGE
-Usage: $0 [OPTIONS]
-
-Options:
-  -d, --domain DOMAIN    Domain for SSL certificate
-  -e, --email EMAIL      Email for Let's Encrypt
-  -h, --help             Show this help
-
-Examples:
-  $0
-  $0 -d panel.example.com -e admin@example.com
-USAGE
+    echo "Usage: $0 [-d DOMAIN] [-e EMAIL] [-h]"
+    echo "  $0 -d panel.example.com -e admin@example.com"
+    exit 0
 }
 
 main() {
     local DOMAIN="" EMAIL=""
-    
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -d|--domain) DOMAIN="$2"; shift 2 ;;
             -e|--email) EMAIL="$2"; shift 2 ;;
-            -h|--help) usage; exit 0 ;;
-            *) log_error "Unknown: $1"; usage; exit 1 ;;
+            -h|--help) usage ;;
+            *) log_error "Unknown: $1"; usage ;;
         esac
     done
-    
-    show_banner
+
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Cadix Panel Installer v$VERSION${NC}"
+    echo -e "${GREEN}========================================${NC}\n"
+
     check_root
     detect_os
-    
-    prep_system
+
     install_deps
     setup_dirs
     write_go_backend
     write_frontend
     write_schema
     write_tools
-    setup_go
+    build_go
     init_db
     setup_nginx
     setup_systemd
     setup_firewall
-    
+
     if [[ -n "$DOMAIN" ]]; then
         setup_ssl "$DOMAIN" "${EMAIL:-admin@$DOMAIN}"
     fi
-    
-    show_completion
-    log_info "Installation complete! http://$(hostname -I | awk '{print $1}')"
+
+    show_summary
+    log_info "Done! http://$(hostname -I | awk '{print $1}')"
 }
 
 main "$@"
