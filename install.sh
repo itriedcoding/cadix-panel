@@ -2,11 +2,13 @@
 set -e
 
 VERSION="1.0.0"
-INSTALL_DIR="/opt/vps-panel"
+INSTALL_DIR="/opt/tooocadix-panel"
+SERVICE_NAME="tooocadix-panel"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -17,8 +19,9 @@ show_banner() {
     cat << EOF
 
 ${GREEN}========================================${NC}
-${GREEN}  VPS Control Panel Installer v$VERSION${NC}
+${GREEN}  TooO Cadix Panel Installer v$VERSION${NC}
 ${GREEN}========================================${NC}
+${YELLOW}Go Backend + TypeScript Frontend${NC}
 
 EOF
 }
@@ -71,11 +74,9 @@ install_dependencies() {
     log_info "Installing dependencies..."
     
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        python3 python3-pip python3-venv python3-dev python3-sqlite3 \
-        python3-requests nginx certbot python3-certbot-nginx curl wget jq git \
-        build-essential ufw sqlite3 2>/dev/null
-    
-    pip3 install flask flask-sqlalchemy requests werkzeug gunicorn -q 2>/dev/null || true
+        golang-go golang-modules golang-doc build-essential \
+        nodejs npm nginx certbot python3-certbot-nginx \
+        curl wget jq git sqlite3 ufw 2>/dev/null
     
     log_info "Dependencies installed"
 }
@@ -83,192 +84,317 @@ install_dependencies() {
 setup_panel_environment() {
     log_info "Setting up panel environment..."
     
-    mkdir -p "$INSTALL_DIR/app" "$INSTALL_DIR/data" "$INSTALL_DIR/templates" \
-        "$INSTALL_DIR/static/css" "$INSTALL_DIR/static/js" "$(dirname $INSTALL_DIR/logs)"
+    mkdir -p "$INSTALL_DIR/app"
+    mkdir -p "$INSTALL_DIR/data"
+    mkdir -p "$INSTALL_DIR/frontend"
+    mkdir -p "$INSTALL_DIR/logs"
     
     chmod -R 755 "$INSTALL_DIR"
     
-    python3 -m venv "$INSTALL_DIR/venv" 2>/dev/null || true
+    go version &>/dev/null || {
+        log_warn "Go not available, will download during build"
+    }
     
-    source "$INSTALL_DIR/venv/bin/activate"
-    pip3 install --upgrade pip -q 2>/dev/null
-    pip3 install flask flask-sqlalchemy requests werkzeug gunicorn python-dotenv -q 2>/dev/null
+    npm --version &>/dev/null || {
+        log_warn "Node.js not available"
+    }
     
-    log_info "Environment ready"
+    log_info "Panel environment ready"
 }
 
-write_app_files() {
-    log_info "Writing application files..."
+write_go_backend() {
+    log_info "Writing Go backend..."
     
-    cat > "$INSTALL_DIR/app/__init__.py" << 'PYEOF'
-import os
-import sys
-sys.path.insert(0, '/opt/vps-panel')
+    cat > "$INSTALL_DIR/app/main.go" << 'GOEOF'
+package main
 
-from flask import Flask, render_template, jsonify
-import json
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
 
-def create_app():
-    app = Flask(__name__)
-    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'vps-panel-secret-key-change-me')
-    
-    @app.route('/')
-    def index():
-        return render_template('index.html')
-    
-    @app.route('/api/status')
-    def api_status():
-        return jsonify({'status': 'ok', 'version': '1.0.0'})
-    
-    @app.route('/api/servers')
-    def api_servers():
-        try:
-            with open('/opt/vps-panel/data/servers.json', 'r') as f:
-                return jsonify(json.load(f))
-        except:
-            return jsonify([])
-    
-    @app.route('/api/system')
-    def api_system():
-        return jsonify({
-            'hostname': os.uname().nodename,
-            'uptime': get_uptime(),
-            'cpu': get_cpu(),
-            'ram_total': get_ram(),
-            'storage': get_storage()
-        })
-    
-    return app
+	_ "github.com/mattn/go-sqlite3"
+)
 
-def get_uptime():
-    try:
-        with open('/proc/uptime', 'r') as f:
-            return str(int(float(f.read().split()[0])))
-    except:
-        return 'unknown'
+var db *sql.DB
 
-def get_cpu():
-    try:
-        with open('/proc/cpuinfo', 'r') as f:
-            for line in f:
-                if 'model name' in line:
-                    return line.split(':')[1].strip()
-        return 'unknown'
-    except:
-        return 'unknown'
-
-def get_ram():
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if line.startswith('MemTotal:'):
-                    return str(int(line.split()[1]) // 1024) + ' MB'
-        return 'unknown'
-    except:
-        return 'unknown'
-
-def get_storage():
-    try:
-        return str(int(os.statvfs('/').f_blocks * os.statvfs('/').f_frsize / (1024*1024))) + ' MB'
-    except:
-        return 'unknown'
-PYEOF
-
-    log_info "Application files written"
+type Server struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	IP    string `json:"ip"`
+	Status string `json:"status"`
 }
 
-write_templates() {
-    log_info "Writing templates..."
+type SystemInfo struct {
+	Hostname    string `json:"hostname"`
+	Uptime      int64  `json:"uptime"`
+	CPU         string `json:"cpu"`
+	RAMTotal    string `json:"ram_total"`
+	RAMUsed     string `json:"ram_used"`
+	Storage     string `json:"storage"`
+}
+
+func main() {
+	var err error
+	db, err = sql.Open("sqlite3", "/opt/tooocadix-panel/data/panel.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	initDB()
+
+	mux := http.NewServeMux()
+	
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "/opt/tooocadix-panel/frontend/index.html")
+	})
+	
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{"status": "ok", "version": "1.0.0"})
+	})
+	
+	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
+		servers := queryServers()
+		writeJSON(w, servers)
+	})
+	
+	mux.HandleFunc("/api/system", func(w http.ResponseWriter, r *http.Request) {
+		info := getSystemInfo()
+		writeJSON(w, info)
+	})
+	
+	mux.HandleFunc("/api/update", func(w http.ResponseWriter, r *http.Request) {
+		result := updateSystem()
+		writeJSON(w, result)
+	})
+	
+	log.Println("Server starting on :5000")
+	log.Fatal(http.ListenAndServe(":5000", mux))
+}
+
+func initDB() {
+	db.Exec(`CREATE TABLE IF NOT EXISTS servers (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		ip TEXT NOT NULL,
+		status TEXT DEFAULT 'offline'
+	)`)
+	
+	db.Exec(`CREATE TABLE IF NOT EXISTS settings (
+		key TEXT PRIMARY KEY,
+		value TEXT
+	)`)
+	
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM servers").Scan(&count)
+	if count == 0 {
+		db.Exec("INSERT INTO servers (name, ip, status) VALUES ('demo', '192.168.1.100', 'online')")
+	}
+}
+
+func queryServers() []Server {
+	rows, err := db.Query("SELECT id, name, ip, status FROM servers")
+	if err != nil {
+		return []Server{}
+	}
+	defer rows.Close()
+	
+	var servers []Server
+	for rows.Next() {
+		var s Server
+		rows.Scan(&s.ID, &s.Name, &s.IP, &s.Status)
+		servers = append(servers, s)
+	}
+	return servers
+}
+
+func getSystemInfo() SystemInfo {
+	info := SystemInfo{}
+	info.Hostname, _ = os.Hostname()
+	
+	if uptimeData, err := ioutil.ReadFile("/proc/uptime"); err == nil {
+		var uptime float64
+		fmt.Sscanf(string(uptimeData), "%f", &uptime)
+		info.Uptime = int64(uptime)
+	}
+	
+	if cpuData, err := ioutil.ReadFile("/proc/cpuinfo"); err == nil {
+		lines := strings.Split(string(cpuData), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "model name") {
+				parts := strings.Split(line, ":")
+				if len(parts) > 1 {
+					info.CPU = strings.TrimSpace(parts[1])
+					break
+				}
+			}
+		}
+	}
+	
+	if memData, err := ioutil.ReadFile("/proc/meminfo"); err == nil {
+		lines := strings.Split(string(memData), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				parts := strings.Fields(line)
+				if len(parts) > 1 {
+					info.RAMTotal = fmt.Sprintf("%s KB", parts[1])
+				}
+			}
+			if strings.HasPrefix(line, "MemAvailable:") {
+				parts := strings.Fields(line)
+				if len(parts) > 1 {
+					info.RAMUsed = fmt.Sprintf("%s KB", parts[1])
+				}
+			}
+		}
+	}
+	
+	if stat := os.Stat("/"); stat != nil {
+		free := int(stat.Sys().(*syscall.Stat_t).Blocks) * 4 / 1024
+		info.Storage = fmt.Sprintf("%d KB free", free)
+	}
+	
+	return info
+}
+
+func updateSystem() map[string]interface{} {
+	result := map[string]interface{}{"status": "ok"}
+	
+	cmd := exec.Command("apt-get", "update")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		result["error"] = string(output)
+	}
+	
+	return result
+}
+
+func writeJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+}
+GOEOF
+
+    log_info "Go backend written"
+}
+
+write_frontend() {
+    log_info "Writing TypeScript frontend..."
     
-    cat > "$INSTALL_DIR/templates/index.html" << 'HTMLEOF'
+    mkdir -p "$INSTALL_DIR/frontend/src"
+    
+    cat > "$INSTALL_DIR/frontend/package.json" << 'NPMEOF'
+{
+  "name": "tooocadix-panel",
+  "version": "1.0.0",
+  "description": "TooO Cadix Panel - Lightweight VPS Control Panel",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^3.1.0",
+    "vite": "^4.4.0"
+  }
+}
+NPMEOF
+
+    cat > "$INSTALL_DIR/frontend/vite.config.js" << 'VITEOF'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+    proxy: {
+      '/api': 'http://localhost:5000'
+    }
+  }
+})
+VITEOF
+
+    cat > "$INSTALL_DIR/frontend/index.html" << 'HTMLEOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VPS Control Panel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
-    <style>
-        body { background: #f5f5f5; }
-        .card { box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .status-online { color: #28a745; }
-        .status-offline { color: #dc3545; }
-    </style>
+    <title>TooO Cadix Panel</title>
+    <script type="module" src="/src/main.jsx"></script>
 </head>
 <body>
-    <div class="container py-4">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h1>VPS Control Panel</h1>
-            <span class="badge bg-primary">v1.0.0</span>
-        </div>
-        <div class="row mb-4">
-            <div class="col-md-3"><div class="card"><div class="card-body">
-                <i class="bi bi-server display-4 text-primary mb-2"></i>
-                <h5 class="card-title">Total Servers</h5>
-                <p class="card-text display-4" id="total-servers">0</p>
-            </div></div></div>
-            <div class="col-md-3"><div class="card"><div class="card-body">
-                <i class="bi bi-cpu display-4 text-success mb-2"></i>
-                <h5 class="card-title">CPU</h5>
-                <p class="card-text" id="cpu-info">Loading...</p>
-            </div></div></div>
-            <div class="col-md-3"><div class="card"><div class="card-body">
-                <i class="bi bi-memory display-4 text-warning mb-2"></i>
-                <h5 class="card-title">RAM</h5>
-                <p class="card-text" id="ram-info">Loading...</p>
-            </div></div></div>
-            <div class="col-md-3"><div class="card"><div class="card-body">
-                <i class="bi bi-hdd display-4 text-danger mb-2"></i>
-                <h5 class="card-title">Storage</h5>
-                <p class="card-text" id="storage-info">Loading...</p>
-            </div></div></div>
-        </div>
-        <div class="card"><div class="card-header"><h5 class="mb-0">Server Status</h5></div>
-            <div class="card-body">
-                <table class="table table-hover" id="servers-table">
-                    <thead><tr><th>Name</th><th>IP</th><th>Status</th><th>Uptime</th></tr></thead>
-                    <tbody></tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        async function loadData() {
-            try {
-                const [serversRes] = await Promise.all([fetch('/api/servers')]);
-                const servers = await serversRes.json();
-                document.getElementById('total-servers').textContent = servers.length;
-                const tbody = document.querySelector('#servers-table tbody');
-                tbody.innerHTML = servers.map(s => '<tr><td>'+s.name+'</td><td>'+s.ip+'</td><td><span class="status-'+s.status+'">'+s.status.toUpperCase()+'</span></td><td>'+s.uptime+'</td></tr>').join('');
-            } catch(e) {}
-        }
-        async function loadSystemInfo() {
-            try {
-                const response = await fetch('/api/system');
-                const data = await response.json();
-                document.getElementById('cpu-info').textContent = data.cpu || 'N/A';
-                document.getElementById('ram-info').textContent = data.ram_total || 'N/A';
-            } catch(e) {}
-        }
-        loadData(); loadSystemInfo(); setInterval(loadData, 30000);
+    <div id="root"></div>
+    <script type="module">
+        import React from 'https://esm.sh/react@18';
+        import ReactDOM from 'https://esm.sh/react-dom@18';
+        
+        const App = () => React.createElement('div', {style: {padding: '20px', fontFamily: 'Arial, sans-serif'}},
+            React.createElement('h1', null, 'TooO Cadix Panel v1.0.0'),
+            React.createElement('div', {id: 'stats'}, 'Loading...')
+        );
+        
+        ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
     </script>
 </body>
 </html>
 HTMLEOF
 
-    log_info "Templates written"
+    cat > "$INSTALL_DIR/frontend/src/main.jsx" << 'JSEOF'
+import React, { useEffect, useState } from 'react';
+import ReactDOM from 'react-dom/client';
+
+function App() {
+    const [status, setStatus] = useState('Loading...');
+    
+    useEffect(() => {
+        fetch('/api/status')
+            .then(r => r.json())
+            .then(data => setStatus(`Status: ${data.status}`))
+            .catch(e => setStatus('Error loading status'));
+    }, []);
+    
+    return (
+        <div style={{padding: '20px', fontFamily: 'Arial, sans-serif'}}>
+            <h1>TooO Cadix Panel</h1>
+            <p>{status}</p>
+        </div>
+    );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+JSEOF
+
+    log_info "Frontend files written"
 }
 
 setup_nginx() {
     log_info "Configuring nginx..."
     
-    cat > /etc/nginx/sites-available/vps-panel << 'NGINXCONF'
+    cat > /etc/nginx/sites-available/tooocadix << 'NGINXCONF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+    
     location / {
         proxy_pass http://127.0.0.1:5000;
         proxy_set_header Host $host;
@@ -280,8 +406,9 @@ server {
 NGINXCONF
 
     mkdir -p /etc/nginx/sites-enabled
-    ln -sf /etc/nginx/sites-available/vps-panel /etc/nginx/sites-enabled/vps-panel
+    ln -sf /etc/nginx/sites-available/tooocadix /etc/nginx/sites-enabled/tooocadix
     rm -f /etc/nginx/sites-enabled/default
+    
     nginx -t 2>/dev/null && systemctl restart nginx 2>/dev/null || log_warn "Nginx config issue"
     log_info "Nginx configured"
 }
@@ -289,34 +416,59 @@ NGINXCONF
 setup_systemd() {
     log_info "Creating systemd service..."
     
-    cat > /etc/systemd/system/vps-panel.service << 'SVCEOF'
+    cat > /etc/systemd/system/tooocadix-panel.service << SVCEOF
 [Unit]
-Description=VPS Control Panel
+Description=TooO Cadix Panel
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/vps-panel
-ExecStart=/opt/vps-panel/venv/bin/gunicorn -w 4 -b 127.0.0.1:5000 app:create_app()
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/go run app/main.go
 Restart=always
 RestartSec=10
+Environment=PATH=/usr/local/go/bin:/usr/bin
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable vps-panel 2>/dev/null || true
-    systemctl start vps-panel 2>/dev/null || true
+    systemctl enable "$SERVICE_NAME" 2>/dev/null || true
+    systemctl start "$SERVICE_NAME" 2>/dev/null || true
     
     log_info "Service created"
 }
 
-init_data() {
-    log_info "Initializing data..."
-    echo '[]' > "$INSTALL_DIR/data/servers.json"
-    log_info "Data initialized"
+init_database() {
+    log_info "Initializing database..."
+    
+    cat > "$INSTALL_DIR/app/schema.sql" << 'SQLEOF'
+CREATE TABLE IF NOT EXISTS servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    status TEXT DEFAULT 'offline',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+SQLEOF
+
+    touch "$INSTALL_DIR/data/panel.db"
+    
+    log_info "Database initialized"
 }
 
 setup_firewall() {
@@ -328,6 +480,7 @@ setup_firewall() {
     ufw allow 22/tcp 2>/dev/null || true
     ufw allow 80/tcp 2>/dev/null || true
     ufw allow 443/tcp 2>/dev/null || true
+    ufw allow 5000/tcp 2>/dev/null || true
     ufw --force enable 2>/dev/null || true
     
     log_info "Firewall configured"
@@ -352,19 +505,31 @@ show_completion() {
     cat << EOF
 
 ========================================
-  VPS Control Panel v$VERSION
+  TooO Cadix Panel v$VERSION
 ========================================
 
 Access: http://$ip
 API: http://$ip/api/status
 
+Backend: Go (Golang)
+Frontend: TypeScript + React
+
 EOF
 }
 
 usage() {
-    echo "Usage: $0 [OPTIONS]"
-    echo "Options: -d DOMAIN, -e EMAIL, -h (help)"
-    echo "Example: $0 -d vps.example.com -e admin@example.com"
+    cat << USAGE
+Usage: $0 [OPTIONS]
+
+Options:
+  -d, --domain DOMAIN    Domain for SSL certificate
+  -e, --email EMAIL      Email for Let's Encrypt registration
+  -h, --help             Show this help
+
+Examples:
+  $0
+  $0 -d panel.example.com -e admin@example.com
+USAGE
 }
 
 main() {
@@ -386,9 +551,8 @@ main() {
     prepare_system
     install_dependencies
     setup_panel_environment
-    write_app_files
-    write_templates
-    init_data
+    write_go_backend
+    init_database
     setup_nginx
     setup_systemd
     setup_firewall
@@ -398,7 +562,7 @@ main() {
     fi
     
     show_completion
-    log_info "Installation complete!"
+    log_info "Installation complete! Check http://$ip for the control panel"
 }
 
 main "$@"

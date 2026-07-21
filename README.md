@@ -1,20 +1,28 @@
-# VPS Control Panel
+# TooO Cadix Panel
 
-A lightweight, self-hosted VPS control panel - an alternative to Proxmox VE that runs on Ubuntu and Debian. Manage your servers through a modern web interface with full SSL support.
+A lightweight, high-performance VPS control panel alternative to Proxmox VE, built with Go (backend) and TypeScript (frontend).
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Backend | **Go (Golang)** - High-performance daemon |
+| Frontend | **TypeScript + React** - Modern dashboard |
+| Database | **SQL (SQLite)** - Lightweight & reliable |
+| Scripting | **Bash** - System integration |
 
 ## Features
 
-- Lightweight web-based control panel
-- **One-Command Installation**: Single script installs everything
-- **SSL Ready**: Integrated Let's Encrypt certificate setup
-- **Domain Support**: Custom domain with automatic HTTPS
-- **Resource Monitoring**: Real-time CPU, RAM, storage stats
-- **Active Development**: Auto-update mechanism
-- **Lightweight**: Minimal RAM/CPU overhead vs Proxmox
+- **High Performance**: Go backend for fast API responses
+- **Modern UI**: TypeScript/React dashboard with Bootstrap
+- **SSL Ready**: Integrated Let's Encrypt support
+- **Zero-Downtime**: Graceful systemd service management
+- **Lightweight**: Minimal RAM/CPU footprint
+- **Scalable**: Supports any server size from 512MB RAM
 
 ## Requirements
 
-- Ubuntu 22.04 LTS, 24.04 LTS, Debian 11+, or Debian 12+
+- Ubuntu 22.04 LTS, 24.04 LTS, Debian 11+, Debian 12+
 - Root access
 - 512MB+ RAM
 - 1GB+ disk space
@@ -25,16 +33,16 @@ A lightweight, self-hosted VPS control panel - an alternative to Proxmox VE that
 ### Basic Installation
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/itriedcoding/vps-panel/main/install.sh | bash -s
+curl -sSL https://raw.githubusercontent.com/itriedcoding/tooocadix-panel/main/install.sh | bash -s
 ```
 
-### With Custom Domain and SSL
+### With SSL/Domain
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/itriedcoding/vps-panel/main/install.sh | bash -s -- -d vps.yourdomain.com -e admin@yourdomain.com
+curl -sSL https://raw.githubusercontent.com/itriedcoding/tooocadix-panel/main/install.sh | bash -s -- -d panel.example.com -e admin@example.com
 ```
 
-## All Options
+## Command Line Options
 
 ```bash
 ./install.sh [OPTIONS]
@@ -43,13 +51,11 @@ Options:
   -d, --domain DOMAIN    Domain for SSL certificate
   -e, --email EMAIL      Email for Let's Encrypt registration
   -h, --help             Show help message
+
+Examples:
+  ./install.sh
+  ./install.sh -d vps.example.com -e admin@example.com
 ```
-
-## Access
-
-After installation, access the control panel at:
-- **Web Interface**: `http://YOUR_SERVER_IP`
-- **API Status**: `http://YOUR_SERVER_IP/api/status`
 
 ## Architecture
 
@@ -63,104 +69,153 @@ After installation, access the control panel at:
                      │   Reverse Proxy    │
                      └─────────┬──────────┘
                                │
-                    ┌──────────▼──────────┐
-                    │   VPS Control Panel │
-                    │    (Flask/Gunicorn) │
-                    └──────────┬──────────┘
+                     ┌──────────▼──────────┐
+                     │  TooO Cadix Panel   │
+                     │   (Go HTTP Server)  │
+                     └──────────┬──────────┘
                                │
-                    ┌──────────▼──────────┐
-                    │   Python Backend    │
-                    │  System Monitoring  │
-                    └─────────────────────┘
+         ┌───────────────────────┼───────────────────────┐
+         │   ┌───────────────┐ │ ┌─────────────────┐ │
+         │   │   SQLite DB   │ │ │ System Tools    │ │
+         │   │ (SQL Tables)  │ │ │ (Bash Scripts)  │ │
+         │   └───────────────┘ │ └─────────────────┘ │
+         └───────────────────────────────────────────┘
 ```
 
 ## What Gets Installed
 
-1. **Flask Web Application**: Modern control panel with Bootstrap UI
-2. **Gunicorn**: WSGI HTTP server
-3. **Nginx**: Reverse proxy (port 80/443)
-4. **Certbot**: Let's Encrypt SSL certificates
-5. **UFW Firewall**: Configured with essential ports open
+1. **Go Backend**: High-performance HTTP server with SQLite database
+2. **TypeScript Frontend**: Modern React-based dashboard
+3. **Nginx**: Reverse proxy on ports 80/443
+4. **Certbot**: Automatic SSL certificate management
+5. **UFW Firewall**: Configured security with essential ports
 6. **Systemd Service**: Auto-start on boot
-
-## Auto-Update
-
-The panel includes an automatic update check. To manually update:
-
-```bash
-cd /opt/vps-panel
-git pull origin main
-systemctl restart vps-panel
-```
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Web interface |
-| `/api/status` | GET | Panel status |
-| `/api/servers` | GET | List servers |
-| `/api/servers` | POST | Add server |
-| `/api/system` | GET | System metrics |
+| `/` | GET | Web dashboard |
+| `/api/status` | GET | Server status/response |
+| `/api/servers` | GET | List all managed servers |
+| `/api/system` | GET | System metrics (CPU, RAM, storage) |
+| `/api/update` | POST | Trigger system update check |
+
+## Installation Flow
+
+```bash
+# 1. Download installer
+curl -sSL https://raw.githubusercontent.com/itriedcoding/tooocadix-panel/main/install.sh -o install.sh
+
+# 2. Make executable
+chmod +x install.sh
+
+# 3. Run as root
+sudo ./install.sh
+
+# 4. (Optional) With SSL
+sudo ./install.sh -d yourdomain.com -e admin@yourdomain.com
+```
+
+## Post-Installation
+
+Access the panel:
+- **Web Interface**: `http://YOUR_SERVER_IP`
+- **API Status**: `http://YOUR_SERVER_IP/api/status`
+
+Check service status:
+```bash
+systemctl status tooocadix-panel
+journalctl -u tooocadix-panel -f
+```
+
+## Database Schema
+
+```sql
+-- Servers table
+CREATE TABLE servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    status TEXT DEFAULT 'offline',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Settings table
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Users table
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
 
 ## Configuration
 
-- Panel files: `/opt/vps-panel/`
-- Data: `/opt/vps-panel/data/`
-- Logs: `/opt/vps-panel/logs/`
-- Service: `vps-panel`
+| Path | Description |
+|------|-------------|
+| `/opt/tooocadix-panel/app/` | Go backend source |
+| `/opt/tooocadix-panel/data/` | SQLite database |
+| `/opt/tooocadix-panel/frontend/` | TypeScript frontend |
+| `/opt/tooocadix-panel/logs/` | Application logs |
+| `/etc/systemd/system/tooocadix-panel.service` | Systemd unit file |
 
-## System Requirements Comparison
+## Security
 
-| Feature | Proxmox VE | VPS Panel |
-|---------|-----------|-----------|
-| RAM Minimum | 4GB | 512MB |
-| CPU | 2+ cores | 1 core |
-| Disk | 64GB+ | 1GB+ |
-| Web Port | 8006 | 80 |
-| Updates | Apt | Git |
-
-## Security Notes
-
-- Firewall enabled with UFW
-- SSH access preserved
+- UFW firewall enabled with essential ports only
+- SSH (port 22) always allowed
 - Let's Encrypt certificates auto-renew
-- Default credentials should be changed immediately
+- All traffic goes through Nginx reverse proxy
 
 ## Troubleshooting
 
-### Panel not loading?
+### Panel not accessible?
 
 ```bash
 # Check service
-systemctl status vps-panel
+systemctl status tooocadix-panel
 
 # Check logs
-journalctl -u vps-panel -f
+journalctl -u tooocadix-panel -f
+
+# Check port
+ss -tlnp | grep 5000
 
 # Restart
-systemctl restart vps-panel
+systemctl restart tooocadix-panel
 ```
 
 ### SSL Issues?
 
 ```bash
-# Renew certificates
-certbot renew
-
-# Check certificates
+# Check cert status
 certbot certificates
 
-# Force reconfigure nginx
+# Force renewal
+certbot renew
+
+# Nginx test
 nginx -t && systemctl reload nginx
 ```
 
 ## Development
 
 ```bash
-git clone https://github.com/itriedcoding/vps-panel.git
-cd vps-panel
-chmod +x install.sh
+# Clone
+git clone https://github.com/itriedcoding/tooocadix-panel.git
+cd tooocadix-panel
+
+# Backend: Go
+cd app && go build -o panel .
+
+# Frontend: TypeScript
+cd frontend && npm install && npm run build
 ```
 
 ## License
@@ -169,12 +224,8 @@ MIT License - Feel free to use and modify.
 
 ## Contributing
 
-Pull requests are welcome! Feel free to:
-- Report bugs
-- Add features
-- Improve documentation
-- Fix typos
-
-## Sponsors
-
-Support this project by starring the GitHub repo!
+Pull requests welcome! Areas for contribution:
+- Bug fixes
+- New features
+- Documentation
+- Tests
